@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# How many nodes to run
+NODES_AMOUNT=${NODES_AMOUNT:-3}
+# First port to use
+BASE_PORT=${BASE_PORT:-7000}
+
+if (( NODES_AMOUNT < 1 )); then
+  echo "NODES_AMOUNT must be >= 1" >&2
+  exit 1
+fi
+
 # Build the project
 cargo build --quiet
 
 pids=()
+ports=()
 
 # Start the nodes
-./target/debug/rust_socket_server 7001 & pids+=($!)
-./target/debug/rust_socket_server 7002 & pids+=($!)
-./target/debug/rust_socket_server 7003 & pids+=($!)
+for ((i=0; i<NODES_AMOUNT; i++)); do
+  port=$((BASE_PORT + i))
+  ./target/debug/rust_socket_server "$port" & pids+=($!)
+  ports+=("$port")
+done
 
 cleanup() {
   if ((${#pids[@]})); then
@@ -19,10 +32,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Set the "next_node" field on all running nodes
-printf 'SET_NEXT 127.0.0.1:7002\n' | nc -N 127.0.0.1 7001
-printf 'SET_NEXT 127.0.0.1:7003\n' | nc -N 127.0.0.1 7002
-printf 'SET_NEXT 127.0.0.1:7001\n' | nc -N 127.0.0.1 7003
+# Give the servers a brief moment to start
+sleep 1
+
+# Set the "next_node" for each node, making it circular
+for ((i=0; i<NODES_AMOUNT; i++)); do
+  src_port=${ports[i]}
+  next_port=${ports[(i+1)%NODES_AMOUNT]}
+  printf 'SET_NEXT 127.0.0.1:%d\n' "$next_port" | nc -N 127.0.0.1 "$src_port"
+done
 
 # Block until user types 'quit'
 while IFS= read -r -p "Type 'quit' to exit: " input; do
