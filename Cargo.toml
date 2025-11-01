@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+
+[lib]
+name = "ring"           # the library crate name users/tests will import
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust_socket_server"
+path = "src/bin/main.rs"
