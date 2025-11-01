@@ -14,13 +14,8 @@ type AnyErr = Box<dyn error::Error + Send + Sync>;
 
 /// Run the TCP server and handle connections.
 pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
-    // 1. Bind to the port using TCP
     let listener = TcpListener::bind(bind_addr).await?;
-
-    // 2. Get the final node address
     let local = listener.local_addr()?;
-
-    // 3. Initialize the node
     let node = Node::new(local.to_string());
     println!("node listening on {}", node.port);
 
@@ -33,14 +28,9 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
         println!("[{}] created {}", node.port, node_dir);
     }
 
-    // Accept & serve forever
     loop {
         let (stream, peer) = listener.accept().await?;
-
-        // Clone the node so it can be used to run the routines
         let node = Arc::clone(&node);
-
-        // Handle the client asynchronously
         tokio::spawn(async move {
             if let Err(e) = handle_client(node, stream).await {
                 eprintln!("client {peer}: error: {e}");
@@ -51,43 +41,37 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
 
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr> {
     let (reader, mut writer) = stream.into_split();
-
-    // Get the message coming from the client
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
     loop {
         line.clear();
-        // Read the first line of the message
         if reader.read_line(&mut line).await? == 0 {
             break;
         }
 
-        // Handle the command
         match protocol::parse_line(&line) {
             Ok(cmd) => match cmd {
                 Command::SetNext(addr) => handle_set_next(&node, &mut writer, addr).await?,
                 Command::Get => handle_get(&node, &mut writer).await?,
                 Command::Ring { ttl, msg } => handle_ring(&node, &mut writer, ttl, msg).await?,
 
-                // WALK commands
+                // WALK
                 Command::WalkStart => handle_walk_start(&node, &mut writer).await?,
-                Command::WalkHop {
-                    token,
-                    start_addr,
-                    history,
-                } => handle_walk_hop(&node, &mut writer, token, start_addr, history).await?,
-                Command::WalkDone { token, history } => {
-                    handle_walk_done(&node, &mut writer, token, history).await?
-                }
+                Command::WalkHop { token, start_addr, history } =>
+                    handle_walk_hop(&node, &mut writer, token, start_addr, history).await?,
+                Command::WalkDone { token, history } =>
+                    handle_walk_done(&node, &mut writer, token, history).await?,
 
-                // FILE commands
-                Command::PushFile { size, name } => {
-                    handle_push_file(&node, &mut reader, &mut writer, size, name).await?
-                }
-                Command::FileHop { token, start_addr, size, name } => {
-                    handle_file_hop(&node, &mut reader, &mut writer, token, start_addr, size, name).await?
-                }
+                // FILE
+                Command::PushFile { size, name } =>
+                    handle_push_file(&node, &mut reader, &mut writer, size, name).await?,
+                Command::FileHop { token, start_addr, size, name } =>
+                    handle_file_hop(&node, &mut reader, &mut writer, token, start_addr, size, name).await?,
+
+                // LIST (local)
+                Command::ListFiles =>
+                    handle_list_files(&node, &mut writer).await?,
             },
             Err(e) => handle_error(&mut writer, e).await?,
         }
@@ -104,9 +88,7 @@ async fn handle_set_next<W: AsyncWrite + Unpin>(
     addr: String,
 ) -> Result<(), AnyErr> {
     node.set_next(addr.clone()).await;
-    writer
-        .write_all(format!("OK next={}\n", addr).as_bytes())
-        .await?;
+    writer.write_all(format!("OK next={}\n", addr).as_bytes()).await?;
     Ok(())
 }
 
@@ -126,7 +108,6 @@ async fn handle_ring<W: AsyncWrite + Unpin>(
 ) -> Result<(), AnyErr> {
     println!("[{}] RING(ttl={}) msg: {}", node.port, ttl, msg);
 
-    // TTL check
     if ttl > 0 {
         ttl -= 1;
         if let Some(next_addr) = node.get_next().await {
@@ -138,7 +119,6 @@ async fn handle_ring<W: AsyncWrite + Unpin>(
         }
     }
 
-    // Reply to client
     writer.write_all(b"OK\n").await?;
     Ok(())
 }
@@ -148,25 +128,19 @@ async fn handle_walk_start<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
-    // 1) Build a token & register an oneshot waiter for completion
     let token = node.make_walk_token();
     let rx = node.register_walk(token.as_str()).await;
 
-    // 2) Start the history with "self->next"
     let Some(history) = node.first_walk_history().await else {
         writer.write_all(b"ERR no next hop set\n").await?;
         return Ok(());
     };
 
-    // 3) Forward the hop
     if let Err(e) = node.forward_walk_hop(&token, &node.port, &history).await {
-        writer
-            .write_all(format!("ERR forward failed: {e}\n").as_bytes())
-            .await?;
+        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
         return Ok(());
     }
 
-    // 4) Wait up to 30s for completion
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
         Ok(Ok(final_history)) => {
             for seg in final_history.split(';').filter(|s| !s.is_empty()) {
@@ -174,18 +148,13 @@ async fn handle_walk_start<W: AsyncWrite + Unpin>(
             }
             writer.write_all(b"OK\n").await?;
         }
-        Ok(Err(_canceled)) => {
-            writer.write_all(b"ERR walk canceled\n").await?;
-        }
-        Err(_elapsed) => {
-            writer.write_all(b"ERR walk timeout\n").await?;
-        }
+        Ok(Err(_)) => { writer.write_all(b"ERR walk canceled\n").await?; }
+        Err(_) => { writer.write_all(b"ERR walk timeout\n").await?; }
     }
 
     Ok(())
 }
 
-/// Handle an in-flight "WALK HOP ..." arriving from the previous node.
 async fn handle_walk_hop<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
@@ -205,10 +174,7 @@ async fn handle_walk_hop<W: AsyncWrite + Unpin>(
             eprintln!("[{}] WALK DONE send failed to {}: {}", node.port, start_addr, e);
         }
     } else {
-        if let Err(e) = node
-            .forward_walk_hop(&token, &start_addr, &new_history)
-            .await
-        {
+        if let Err(e) = node.forward_walk_hop(&token, &start_addr, &new_history).await {
             eprintln!("[{}] WALK forward failed to {}: {}", node.port, next_addr, e);
         }
     }
@@ -217,7 +183,6 @@ async fn handle_walk_hop<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Handle "WALK DONE ..." arriving at the start node.
 async fn handle_walk_done<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
@@ -242,10 +207,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Ensure we have a next hop
+    // Ensure we have a next hop (so the ring is valid)
     let Some(_next) = node.get_next().await else {
         writer.write_all(b"ERR no next hop set\n").await?;
-        // Still need to drain the bytes from the client to keep the connection sane.
+        // Drain bytes to keep connection sane
         let mut sink = vec![0u8; size as usize];
         reader.read_exact(&mut sink).await?;
         return Ok(());
@@ -264,9 +229,7 @@ where
 
     // Forward around the ring
     if let Err(e) = node.forward_file_hop(&token, &node.port, size, &name, &buf).await {
-        writer
-            .write_all(format!("ERR forward failed: {e}\n").as_bytes())
-            .await?;
+        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
         return Ok(());
     }
 
@@ -275,21 +238,14 @@ where
         Ok(Ok(())) => {
             writer
                 .write_all(
-                    format!(
-                        "FILE {} bytes '{}' shared with all nodes\nOK\n",
-                        size, name
-                    )
+                    format!("FILE {} bytes '{}' shared with all nodes\nOK\n", size, name)
                         .as_bytes(),
                 )
                 .await?;
             println!("[{}] file shared: {} ({} bytes) -> {}", node.port, name, size, saved_as.display());
         }
-        Ok(Err(_canceled)) => {
-            writer.write_all(b"ERR file share canceled\n").await?;
-        }
-        Err(_elapsed) => {
-            writer.write_all(b"ERR file share timeout\n").await?;
-        }
+        Ok(Err(_)) => { writer.write_all(b"ERR file share canceled\n").await?; }
+        Err(_) => { writer.write_all(b"ERR file share timeout\n").await?; }
     }
 
     Ok(())
@@ -314,19 +270,17 @@ where
 
     // If this hop delivered back to the start node, just finish & ACK.
     if port_str(&node.port) == port_str(&start_addr) {
-        // Do not save again on the origin — just signal completion.
         let _ = node.finish_file(&token).await;
         let _ = writer.write_all(b"OK\n").await;
         return Ok(());
     }
 
-    // Save locally
+    // Save locally (best-effort)
     if let Err(e) = save_into_node_dir(node, &name, &buf).await {
         eprintln!("[{}] failed to save file '{}': {}", node.port, name, e);
-        // Proceed to forward anyway to keep the ring flowing.
     }
 
-    // Forward to next or, if the next is the start, the start will complete.
+    // Forward to next
     if let Some(_) = node.get_next().await {
         if let Err(e) = node.forward_file_hop(&token, &start_addr, size, &name, &buf).await {
             eprintln!("[{}] FILE forward failed: {}", node.port, e);
@@ -337,19 +291,35 @@ where
     Ok(())
 }
 
+/* -------- LIST_FILES: local-only listing -------- */
+
+async fn handle_list_files<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    let files = list_local_files(node).await?;
+    if files.is_empty() {
+        writer.write_all(b"(empty)\n").await?;
+    } else {
+        for f in files {
+            writer.write_all(format!("{}\n", f).as_bytes()).await?;
+        }
+    }
+    writer.write_all(b"OK\n").await?;
+    Ok(())
+}
+
 /* --- Helpers & Errors --- */
 
 async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Result<(), AnyErr> {
-    writer
-        .write_all(format!("ERR {}\n", err).as_bytes())
-        .await?;
+    writer.write_all(format!("ERR {}\n", err).as_bytes()).await?;
     Ok(())
 }
 
 fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
-        let bad = ch == '/' || ch == '\\' || ch == '\0' || ch == ':';
+        let bad = ch == '/' || ch == '\\' || ch == '\0' || ch == ':' || ch == '|' || ch == ';' || ch == '\n' || ch == '\r';
         if bad { out.push('_'); } else { out.push(ch); }
     }
     if out.is_empty() { "_".into() } else { out }
@@ -360,4 +330,30 @@ async fn save_into_node_dir(node: &Node, name: &str, data: &[u8]) -> Result<Path
     let path = PathBuf::from(format!("nodes/{}/{}", port_str(&node.port), fname));
     fs::write(&path, data).await?;
     Ok(path)
+}
+
+async fn list_local_files(node: &Node) -> Result<Vec<String>, AnyErr> {
+    let dir = format!("nodes/{}", port_str(&node.port));
+    let mut out = Vec::new();
+    let mut rd = match fs::read_dir(&dir).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[{}] read_dir {} failed: {}", node.port, dir, e);
+            return Ok(out);
+        }
+    };
+
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        let ty = ent.file_type().await;
+        if let Ok(t) = ty {
+            if t.is_file() {
+                if let Some(name) = ent.file_name().to_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    out.sort_unstable();
+    Ok(out)
 }

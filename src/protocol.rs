@@ -12,16 +12,19 @@
 //!   - "PUSH_FILE <size> <name>"                         (client -> start)
 //!   - "FILE HOP <token> <start_addr> <size> <name>"     (node -> node)
 //!
+//! Local listing:
+//!   - "LIST_FILES"                                      (client -> any node)
+//!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
 
 /// Parsed representation of a command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    // Existing verbs
+    // Core verbs
     SetNext(String),                   // SET_NEXT <addr>
     Get,                               // GET
-    Ring { ttl: u32, msg: String },   // RING <ttl> <message...>
+    Ring { ttl: u32, msg: String },    // RING <ttl> <message...>
 
     // WALK verbs
     WalkStart,                                             // "WALK"
@@ -29,32 +32,30 @@ pub enum Command {
     WalkDone { token: String, history: String },           // "WALK DONE ..."
 
     // FILE verbs
-    /// Header for a client-initiated file push. The binary body of exactly `size`
-    /// bytes follows this header on the same connection.
-    PushFile { size: u64, name: String },
-    /// Header for a node-to-node hop carrying the file body.
-    FileHop { token: String, start_addr: String, size: u64, name: String },
+    PushFile { size: u64, name: String },                  // client -> start
+    FileHop { token: String, start_addr: String, size: u64, name: String }, // node -> node
+
+    // LIST (local)
+    ListFiles,                                             // "LIST_FILES"
 }
 
 /// Parse one incoming line from the wire into a Command.
-/// Returns an error string if the command is unknown or malformed.
 pub fn parse_line(line: &str) -> Result<Command, String> {
-    // 1) Trim typical line endings
     let trimmed = line.trim_end_matches(['\r', '\n']);
 
-    // 2) SET_NEXT <addr>
+    // SET_NEXT <addr>
     if let Some(rest) = trimmed.strip_prefix("SET_NEXT ") {
         let addr = rest.trim();
         if addr.is_empty() { return Err("missing address".into()); }
         return Ok(Command::SetNext(addr.to_string()));
     }
 
-    // 3) GET
+    // GET
     if trimmed == "GET" {
         return Ok(Command::Get);
     }
 
-    // 4) RING <ttl> <message...>
+    // RING <ttl> <message...>
     if let Some(rest) = trimmed.strip_prefix("RING ") {
         let mut parts = rest.splitn(2, ' ');
         let ttl_str = parts.next().unwrap_or("");
@@ -63,13 +64,12 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         return Ok(Command::Ring { ttl, msg });
     }
 
-    // 5) WALK (client -> start)
+    // WALK
     if trimmed == "WALK" {
         return Ok(Command::WalkStart);
     }
 
-    // 6) WALK HOP <token> <start_addr> <history>
-    // Use splitn(3, ' ') to preserve spaces inside <history> (even though we use ';')
+    // WALK HOP <token> <start_addr> <history>
     if let Some(rest) = trimmed.strip_prefix("WALK HOP ") {
         let mut parts = rest.splitn(3, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -85,7 +85,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         });
     }
 
-    // 7) WALK DONE <token> <history>
+    // WALK DONE <token> <history>
     if let Some(rest) = trimmed.strip_prefix("WALK DONE ") {
         let mut parts = rest.splitn(2, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -96,8 +96,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         return Ok(Command::WalkDone { token: token.to_string(), history });
     }
 
-    // 8) PUSH_FILE <size> <name>
-    // Keep <name> as-is (may contain spaces) using splitn(2, ' ')
+    // PUSH_FILE <size> <name>
     if let Some(rest) = trimmed.strip_prefix("PUSH_FILE ") {
         let mut parts = rest.splitn(2, ' ');
         let size_str = parts.next().unwrap_or("").trim();
@@ -107,7 +106,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         return Ok(Command::PushFile { size, name });
     }
 
-    // 9) FILE HOP <token> <start_addr> <size> <name>
+    // FILE HOP <token> <start_addr> <size> <name>
     if let Some(rest) = trimmed.strip_prefix("FILE HOP ") {
         let mut parts = rest.splitn(4, ' ');
         let token = parts.next().unwrap_or("").trim();
@@ -121,6 +120,10 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
         return Ok(Command::FileHop { token: token.to_string(), start_addr: start_addr.to_string(), size, name });
     }
 
-    // 10) Unknown verb
+    // LIST_FILES
+    if trimmed == "LIST_FILES" {
+        return Ok(Command::ListFiles);
+    }
+
     Err("unknown command".into())
 }

@@ -13,12 +13,9 @@ use tokio::{
 
 /// Shared node state & actions.
 ///
-/// Notes:
-/// - `next_port` is the *configured* next hop in the ring (if any).
-/// - WALK keeps no persistent topology; the path rides along with the message.
-/// - For WALK and FILE, the *start node* allocates short-lived "pending" entries
-///   keyed by tokens so we can reply on the same client connection when the
-///   loop closes.
+/// - `next_port`: configured next hop (if any).
+/// - WALK uses a token->oneshot table at the start node.
+/// - FILE push also uses token->oneshot at the start node (to confirm loop).
 #[derive(Debug)]
 pub struct Node {
     /// Where this node is listening (e.g., "127.0.0.1:7001")
@@ -27,17 +24,16 @@ pub struct Node {
     /// Address of the next node in the ring; None until set via SET_NEXT
     pub next_port: RwLock<Option<String>>,
 
-    // --- ephemeral, per-request state (start node only) ---
+    // WALK pending acks (start node only)
     pending_walks: RwLock<HashMap<String, oneshot::Sender<String>>>,
     walk_counter: AtomicU64,
 
-    // File transfer pending acks
+    // FILE pending acks (start node only)
     pending_files: RwLock<HashMap<String, oneshot::Sender<()>>>,
     file_counter: AtomicU64,
 }
 
 impl Node {
-    /// Construct a new node handle (wrapped in Arc for cheap clones).
     pub fn new(port: String) -> Arc<Self> {
         Arc::new(Self {
             port,
@@ -49,19 +45,16 @@ impl Node {
         })
     }
 
-    /// Update the `next_port` pointer.
     pub async fn set_next(&self, addr: String) {
         *self.next_port.write().await = Some(addr);
     }
 
-    /// Read the `next_port` pointer.
     pub async fn get_next(&self) -> Option<String> {
         self.next_port.read().await.clone()
     }
 
-    /* ---------------- Existing RING forwarding ---------------- */
+    /* ---------------- RING forwarding ---------------- */
 
-    /// Fire-and-forget forward of a RING command to the next node.
     pub async fn forward_ring(
         &self,
         ttl: u32,
@@ -77,21 +70,21 @@ impl Node {
 
     /* ---------------- WALK helpers ---------------- */
 
-    /// Create a unique token for a WALK request (scoped to this node address).
     fn next_token(&self) -> String {
         let n = self.walk_counter.fetch_add(1, Ordering::Relaxed);
         format!("{}-{}", self.port, n)
     }
 
-    /// Register a pending WALK at the start node and get a receiver we can await.
+    pub fn make_walk_token(&self) -> String {
+        self.next_token()
+    }
+
     pub async fn register_walk(&self, token: &str) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
         self.pending_walks.write().await.insert(token.to_string(), tx);
         rx
     }
 
-    /// Complete a pending WALK (if any) and deliver the final history.
-    /// Returns `true` if a waiter was found.
     pub async fn finish_walk(&self, token: &str, history: String) -> bool {
         if let Some(tx) = self.pending_walks.write().await.remove(token) {
             let _ = tx.send(history);
@@ -101,28 +94,25 @@ impl Node {
         }
     }
 
-    /// Forward one WALK hop to `next` with the current single-line history.
     pub async fn forward_walk_hop(
         &self,
         token: &str,
         start_addr: &str,
-        history: &str, // semicolon-separated list of edges
+        history: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(next) = self.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            // Single-line payload (critical for a line-delimited protocol)
             let line = format!("WALK HOP {} {} {}\n", token, start_addr, history);
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
     }
 
-    /// Send the final result back to the start node (closing the loop).
     pub async fn send_walk_done(
         &self,
         start_addr: &str,
         token: &str,
-        history: &str, // semicolon-separated
+        history: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut s = TcpStream::connect(start_addr).await?;
         let line = format!("WALK DONE {} {}\n", token, history);
@@ -132,25 +122,21 @@ impl Node {
 
     /* ---------------- FILE helpers ---------------- */
 
-    /// Unique token for a FILE request.
     fn next_file_token(&self) -> String {
         let n = self.file_counter.fetch_add(1, Ordering::Relaxed);
         format!("file-{}-{}", self.port, n)
     }
 
-    /// Expose a public token factory for the server (files).
     pub fn make_file_token(&self) -> String {
         self.next_file_token()
     }
 
-    /// Register a pending file share completion.
     pub async fn register_file(&self, token: &str) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         self.pending_files.write().await.insert(token.to_string(), tx);
         rx
     }
 
-    /// Complete a pending file share.
     pub async fn finish_file(&self, token: &str) -> bool {
         if let Some(tx) = self.pending_files.write().await.remove(token) {
             let _ = tx.send(());
@@ -160,7 +146,6 @@ impl Node {
         }
     }
 
-    /// Forward a FILE hop to the next node (header + binary body).
     pub async fn forward_file_hop(
         &self,
         token: &str,
@@ -179,16 +164,12 @@ impl Node {
     }
 }
 
-/* ---------- utility helpers used by WALK flow ---------- */
+/* ---------- WALK utility ---------- */
 
-/// Extract the port number from "ip:port" (falls back to the whole string
-/// if the format is unexpected).
 pub fn port_str(addr: &str) -> &str {
     addr.rsplit(':').next().unwrap_or(addr)
 }
 
-/// Append "A->B" to a **single-line** history using ';' as the delimiter.
-/// On the wire we MUST stay single-line because the protocol is line-delimited.
 pub fn append_edge(mut history: String, from_addr: &str, to_addr: &str) -> String {
     let from = port_str(from_addr);
     let to = port_str(to_addr);
@@ -203,14 +184,8 @@ pub fn append_edge(mut history: String, from_addr: &str, to_addr: &str) -> Strin
 }
 
 impl Node {
-    /// Convenience: start the history with "self->next".
     pub async fn first_walk_history(&self) -> Option<String> {
         let next = self.get_next().await?;
         Some(append_edge(String::new(), &self.port, &next))
-    }
-
-    /// Expose a public token factory for the server (walks).
-    pub fn make_walk_token(&self) -> String {
-        self.next_token()
     }
 }
