@@ -15,11 +15,10 @@ use tokio::{
 ///
 /// Notes:
 /// - `next_port` is the *configured* next hop in the ring (if any).
-/// - We keep **no persistent topology** for WALK. The entire path is carried
-///   inside the message (`history`) hop-by-hop.
-/// - Only the *start node* allocates a short-lived "pending walk" entry
-///   (an oneshot sender keyed by `token`) so we can reply on the same client
-///   connection when the loop closes.
+/// - WALK keeps no persistent topology; the path rides along with the message.
+/// - For WALK and FILE, the *start node* allocates short-lived "pending" entries
+///   keyed by tokens so we can reply on the same client connection when the
+///   loop closes.
 #[derive(Debug)]
 pub struct Node {
     /// Where this node is listening (e.g., "127.0.0.1:7001")
@@ -31,6 +30,10 @@ pub struct Node {
     // --- ephemeral, per-request state (start node only) ---
     pending_walks: RwLock<HashMap<String, oneshot::Sender<String>>>,
     walk_counter: AtomicU64,
+
+    // File transfer pending acks
+    pending_files: RwLock<HashMap<String, oneshot::Sender<()>>>,
+    file_counter: AtomicU64,
 }
 
 impl Node {
@@ -41,6 +44,8 @@ impl Node {
             next_port: RwLock::new(None),
             pending_walks: RwLock::new(HashMap::new()),
             walk_counter: AtomicU64::new(1),
+            pending_files: RwLock::new(HashMap::new()),
+            file_counter: AtomicU64::new(1),
         })
     }
 
@@ -124,6 +129,54 @@ impl Node {
         s.write_all(line.as_bytes()).await?;
         Ok(())
     }
+
+    /* ---------------- FILE helpers ---------------- */
+
+    /// Unique token for a FILE request.
+    fn next_file_token(&self) -> String {
+        let n = self.file_counter.fetch_add(1, Ordering::Relaxed);
+        format!("file-{}-{}", self.port, n)
+    }
+
+    /// Expose a public token factory for the server (files).
+    pub fn make_file_token(&self) -> String {
+        self.next_file_token()
+    }
+
+    /// Register a pending file share completion.
+    pub async fn register_file(&self, token: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_files.write().await.insert(token.to_string(), tx);
+        rx
+    }
+
+    /// Complete a pending file share.
+    pub async fn finish_file(&self, token: &str) -> bool {
+        if let Some(tx) = self.pending_files.write().await.remove(token) {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Forward a FILE hop to the next node (header + binary body).
+    pub async fn forward_file_hop(
+        &self,
+        token: &str,
+        start_addr: &str,
+        size: u64,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(next) = self.get_next().await {
+            let mut s = TcpStream::connect(&next).await?;
+            let header = format!("FILE HOP {} {} {} {}\n", token, start_addr, size, name);
+            s.write_all(header.as_bytes()).await?;
+            s.write_all(data).await?;
+        }
+        Ok(())
+    }
 }
 
 /* ---------- utility helpers used by WALK flow ---------- */
@@ -156,7 +209,7 @@ impl Node {
         Some(append_edge(String::new(), &self.port, &next))
     }
 
-    /// Expose a public token factory for the server.
+    /// Expose a public token factory for the server (walks).
     pub fn make_walk_token(&self) -> String {
         self.next_token()
     }

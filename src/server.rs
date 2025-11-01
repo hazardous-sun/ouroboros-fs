@@ -1,8 +1,9 @@
-use std::{error, sync::Arc, time::Duration};
+use std::{error, sync::Arc, time::Duration, path::PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader
+};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 
 use crate::{
     node::{port_str, append_edge, Node},
@@ -23,7 +24,7 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
     let node = Node::new(local.to_string());
     println!("node listening on {}", node.port);
 
-    // (NEW) 4. Create nodes/<port> directory once this node is up
+    // Create nodes/<port> directory once this node is up
     let port_only = port_str(&node.port);
     let node_dir = format!("nodes/{}", port_only);
     if let Err(e) = fs::create_dir_all(&node_dir).await {
@@ -32,7 +33,7 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
         println!("[{}] created {}", node.port, node_dir);
     }
 
-    // 5. Accept & serve forever
+    // Accept & serve forever
     loop {
         let (stream, peer) = listener.accept().await?;
 
@@ -78,6 +79,14 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 } => handle_walk_hop(&node, &mut writer, token, start_addr, history).await?,
                 Command::WalkDone { token, history } => {
                     handle_walk_done(&node, &mut writer, token, history).await?
+                }
+
+                // FILE commands
+                Command::PushFile { size, name } => {
+                    handle_push_file(&node, &mut reader, &mut writer, size, name).await?
+                }
+                Command::FileHop { token, start_addr, size, name } => {
+                    handle_file_hop(&node, &mut reader, &mut writer, token, start_addr, size, name).await?
                 }
             },
             Err(e) => handle_error(&mut writer, e).await?,
@@ -220,11 +229,135 @@ async fn handle_walk_done<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* --- Errors --- */
+/* -------- FILE: PUSH / HOP handlers -------- */
+
+async fn handle_push_file<R, W>(
+    node: &Node,
+    reader: &mut R,
+    writer: &mut W,
+    size: u64,
+    name: String,
+) -> Result<(), AnyErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Ensure we have a next hop
+    let Some(_next) = node.get_next().await else {
+        writer.write_all(b"ERR no next hop set\n").await?;
+        // Still need to drain the bytes from the client to keep the connection sane.
+        let mut sink = vec![0u8; size as usize];
+        reader.read_exact(&mut sink).await?;
+        return Ok(());
+    };
+
+    // Read exactly `size` bytes from client
+    let mut buf = vec![0u8; size as usize];
+    reader.read_exact(&mut buf).await?;
+
+    // Store locally under nodes/<port>/<name>
+    let saved_as = save_into_node_dir(node, &name, &buf).await?;
+
+    // Prepare token & waiter
+    let token = node.make_file_token();
+    let rx = node.register_file(&token).await;
+
+    // Forward around the ring
+    if let Err(e) = node.forward_file_hop(&token, &node.port, size, &name, &buf).await {
+        writer
+            .write_all(format!("ERR forward failed: {e}\n").as_bytes())
+            .await?;
+        return Ok(());
+    }
+
+    // Wait up to 60s for loop completion (file returns to start)
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(())) => {
+            writer
+                .write_all(
+                    format!(
+                        "FILE {} bytes '{}' shared with all nodes\nOK\n",
+                        size, name
+                    )
+                        .as_bytes(),
+                )
+                .await?;
+            println!("[{}] file shared: {} ({} bytes) -> {}", node.port, name, size, saved_as.display());
+        }
+        Ok(Err(_canceled)) => {
+            writer.write_all(b"ERR file share canceled\n").await?;
+        }
+        Err(_elapsed) => {
+            writer.write_all(b"ERR file share timeout\n").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_file_hop<R, W>(
+    node: &Node,
+    reader: &mut R,
+    writer: &mut W,
+    token: String,
+    start_addr: String,
+    size: u64,
+    name: String,
+) -> Result<(), AnyErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Read the exact file body first
+    let mut buf = vec![0u8; size as usize];
+    reader.read_exact(&mut buf).await?;
+
+    // If this hop delivered back to the start node, just finish & ACK.
+    if port_str(&node.port) == port_str(&start_addr) {
+        // Do not save again on the origin — just signal completion.
+        let _ = node.finish_file(&token).await;
+        let _ = writer.write_all(b"OK\n").await;
+        return Ok(());
+    }
+
+    // Save locally
+    if let Err(e) = save_into_node_dir(node, &name, &buf).await {
+        eprintln!("[{}] failed to save file '{}': {}", node.port, name, e);
+        // Proceed to forward anyway to keep the ring flowing.
+    }
+
+    // Forward to next or, if the next is the start, the start will complete.
+    if let Some(_) = node.get_next().await {
+        if let Err(e) = node.forward_file_hop(&token, &start_addr, size, &name, &buf).await {
+            eprintln!("[{}] FILE forward failed: {}", node.port, e);
+        }
+    }
+
+    let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+/* --- Helpers & Errors --- */
 
 async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Result<(), AnyErr> {
     writer
         .write_all(format!("ERR {}\n", err).as_bytes())
         .await?;
     Ok(())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        let bad = ch == '/' || ch == '\\' || ch == '\0' || ch == ':';
+        if bad { out.push('_'); } else { out.push(ch); }
+    }
+    if out.is_empty() { "_".into() } else { out }
+}
+
+async fn save_into_node_dir(node: &Node, name: &str, data: &[u8]) -> Result<PathBuf, AnyErr> {
+    let fname = sanitize_filename(name);
+    let path = PathBuf::from(format!("nodes/{}/{}", port_str(&node.port), fname));
+    fs::write(&path, data).await?;
+    Ok(path)
 }
