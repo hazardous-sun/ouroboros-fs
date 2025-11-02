@@ -18,6 +18,7 @@
 //! File transfer (line header + exact number of binary bytes):
 //!   - "PUSH_FILE <size> <name>"                         (client -> start)
 //!   - "FILE HOP <token> <start_addr> <size> <name>"     (node -> node)
+//!   - "FILE PIPE HOP <token> <start_addr> <file_size> <parts> <index> <name>"
 //!
 //! Local listing:
 //!   - "LIST_FILES"                                      (client -> any node)
@@ -78,6 +79,16 @@ pub enum Command {
         name: String,
     }, // node -> node
 
+    // New chunk-pipeline hop: stream remaining bytes across the ring
+    FilePipeHop {
+        token: String,
+        start_addr: String,
+        file_size: u64,
+        parts: u32,
+        index: u32,
+        name: String,
+    },
+
     // LIST (local)
     ListFiles, // "LIST_FILES"
 }
@@ -87,77 +98,54 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
 
     // SET_NEXT <addr>
-    if let Ok(cmd) = set_next(trimmed) {
-        return Ok(cmd);
-    }
+    if let Ok(cmd) = set_next(trimmed) { return Ok(cmd); }
 
     // GET
-    if trimmed == "GET" {
+    if trimmed.eq_ignore_ascii_case("GET") {
         return Ok(Command::Get);
     }
 
-    // RING <ttl> <message...>
-    if let Ok(cmd) = ring(trimmed) {
-        return Ok(cmd);
-    }
+    // RING <ttl> <msg>
+    if let Ok(cmd) = ring(trimmed) { return Ok(cmd); }
 
     // WALK
-    if trimmed == "WALK" {
+    if trimmed.eq_ignore_ascii_case("WALK") {
         return Ok(Command::WalkStart);
     }
+    if let Ok(cmd) = walk_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = walk_done(trimmed) { return Ok(cmd); }
 
-    // WALK HOP <token> <start_addr> <history>
-    if let Ok(cmd) = walk_hop(trimmed) {
-        return Ok(cmd);
-    }
-
-    // WALK DONE <token> <history>
-    if let Ok(cmd) = walk_done(trimmed) {
-        return Ok(cmd);
-    }
-
-    // INVESTIGATE
-    if trimmed == "INVESTIGATE" {
+    // INVESTIGATE / NETMAP
+    if trimmed.eq_ignore_ascii_case("INVESTIGATE") {
         return Ok(Command::InvestigateStart);
     }
-
-    // INVEST HOP <token> <start_addr> <entries>
-    if let Ok(cmd) = invest_hop(trimmed) {
-        return Ok(cmd);
-    }
-
-    // INVEST DONE <token> <entries>
-    if let Ok(cmd) = invest_done(trimmed) {
-        return Ok(cmd);
-    }
-
-    // NETMAP SET <entries>
+    if let Ok(cmd) = invest_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = invest_done(trimmed) { return Ok(cmd); }
     if let Some(rest) = trimmed.strip_prefix("NETMAP SET ") {
-        return Ok(Command::NetmapSet { entries: rest.to_string() });
+        return Ok(Command::NetmapSet { entries: rest.trim().to_string() });
     }
-
-    // NETMAP GET
-    if trimmed == "NETMAP GET" {
+    if trimmed.eq_ignore_ascii_case("NETMAP GET") {
         return Ok(Command::NetmapGet);
     }
 
-    // PUSH_FILE <size> <name>
-    if let Ok(cmd) = push_file(trimmed) {
-        return Ok(cmd);
-    }
+    // FILE PUSH / HOP
+    if let Ok(cmd) = push_file(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = file_hop(trimmed) { return Ok(cmd); }
 
-    // FILE HOP <token> <start_addr> <size> <name>
-    if let Ok(cmd) = file_hop(trimmed) {
+    // FILE PIPE HOP <token> <start_addr> <file_size> <parts> <index> <name>
+    if let Ok(cmd) = file_pipe_hop(trimmed) {
         return Ok(cmd);
     }
 
     // LIST_FILES
-    if trimmed == "LIST_FILES" {
+    if trimmed.eq_ignore_ascii_case("LIST_FILES") {
         return Ok(Command::ListFiles);
     }
 
     Err("unknown command".into())
 }
+
+/* --- helpers --- */
 
 fn set_next(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("SET_NEXT ") {
@@ -173,8 +161,8 @@ fn set_next(trimmed: &str) -> Result<Command, String> {
 fn ring(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("RING ") {
         let mut parts = rest.splitn(2, ' ');
-        let ttl_str = parts.next().unwrap_or("");
-        let msg = parts.next().unwrap_or("").trim().to_string();
+        let ttl_str = parts.next().unwrap_or("").trim();
+        let msg = parts.next().unwrap_or("").to_string();
         let ttl = ttl_str.parse::<u32>().map_err(|_| "invalid ttl")?;
         return Ok(Command::Ring { ttl, msg });
     }
@@ -278,6 +266,33 @@ fn file_hop(trimmed: &str) -> Result<Command, String> {
             token: token.to_string(),
             start_addr: start_addr.to_string(),
             size,
+            name,
+        });
+    }
+    Err("wrong command".into())
+}
+
+fn file_pipe_hop(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("FILE PIPE HOP ") {
+        let mut parts = rest.splitn(6, ' ');
+        let token = parts.next().unwrap_or("").trim();
+        let start_addr = parts.next().unwrap_or("").trim();
+        let file_size_str = parts.next().unwrap_or("").trim();
+        let total_parts_str = parts.next().unwrap_or("").trim();
+        let index_str = parts.next().unwrap_or("").trim();
+        let name = parts.next().unwrap_or("").to_string();
+        if token.is_empty() || start_addr.is_empty() || name.is_empty() {
+            return Err("malformed FILE PIPE HOP".into());
+        }
+        let file_size = file_size_str.parse::<u64>().map_err(|_| "invalid file_size")?;
+        let parts_u = total_parts_str.parse::<u32>().map_err(|_| "invalid parts")?;
+        let index = index_str.parse::<u32>().map_err(|_| "invalid index")?;
+        return Ok(Command::FilePipeHop {
+            token: token.to_string(),
+            start_addr: start_addr.to_string(),
+            file_size,
+            parts: parts_u,
+            index,
             name,
         });
     }

@@ -12,6 +12,12 @@ use tokio::{
     sync::{RwLock, oneshot},
 };
 
+#[derive(Debug, Clone)]
+pub struct FileTag {
+    pub start: u16,
+    pub size: u64,
+}
+
 /// Shared node state & actions.
 ///
 /// - `next_port`: configured next hop (if any).
@@ -19,7 +25,7 @@ use tokio::{
 /// - FILE push also uses token->oneshot at the start node (to confirm loop).
 #[derive(Debug)]
 pub struct Node {
-    /// Where this node is listening (e.g., "127.0.0.1:7001")
+    /// Where this node is listening (e.g. "127.0.0.1:7001")
     pub port: String,
 
     /// Address of the next node in the ring; None until set via SET_NEXT
@@ -35,6 +41,9 @@ pub struct Node {
 
     /// Status of all nodes on the network
     network_nodes: RwLock<HashMap<String, NodeStatus>>,
+
+    /// Mapping of file name -> (start port, size)
+    pub file_tags: RwLock<HashMap<String, FileTag>>,
 }
 
 impl Node {
@@ -49,6 +58,7 @@ impl Node {
             pending_files: RwLock::new(HashMap::new()),
             file_counter: AtomicU64::new(1),
             network_nodes,
+            file_tags: RwLock::new(HashMap::new()),
         })
     }
 
@@ -59,8 +69,6 @@ impl Node {
     pub async fn get_next(&self) -> Option<String> {
         self.next_port.read().await.clone()
     }
-
-    /* ---------------- RING forwarding ---------------- */
 
     pub async fn forward_ring(
         &self,
@@ -73,6 +81,15 @@ impl Node {
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
+    }
+
+    /* ---------------- FILE TAGS ---------------- */
+
+    pub async fn set_file_tag(&self, name: &str, start_port: u16, size: u64) {
+        self.file_tags.write().await.insert(
+            name.to_string(),
+            FileTag { start: start_port, size }
+        );
     }
 
     /* ---------------- WALK helpers ---------------- */
@@ -95,15 +112,6 @@ impl Node {
         rx
     }
 
-    pub async fn finish_walk(&self, token: &str, history: String) -> bool {
-        if let Some(tx) = self.pending_walks.write().await.remove(token) {
-            let _ = tx.send(history);
-            true
-        } else {
-            false
-        }
-    }
-
     pub async fn forward_walk_hop(
         &self,
         token: &str,
@@ -116,6 +124,15 @@ impl Node {
             s.write_all(line.as_bytes()).await?;
         }
         Ok(())
+    }
+
+    pub async fn finish_walk(&self, token: &str, history: String) -> bool {
+        if let Some(tx) = self.pending_walks.write().await.remove(token) {
+            let _ = tx.send(history);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn send_walk_done(
@@ -237,9 +254,7 @@ fn serialize_entries(map: &HashMap<String, NodeStatus>) -> String {
     keys.sort_unstable();
     let mut out = String::new();
     for (i, k) in keys.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
+        if i > 0 { out.push(','); }
         out.push_str(k);
         out.push('=');
         out.push_str(match map.get(k) {
@@ -268,27 +283,20 @@ impl Node {
         *self.network_nodes.write().await = map;
     }
 
+    /// NEW: quick count of known nodes (>=1)
+    pub async fn network_size(&self) -> usize {
+        let n = self.network_nodes.read().await.len();
+        if n == 0 { 1 } else { n }
+    }
+
     /// NEW: Human-friendly lines for "NETMAP GET"
     pub async fn get_network_nodes_lines(&self) -> Vec<String> {
         let map = self.network_nodes.read().await;
         let mut keys: Vec<_> = map.keys().cloned().collect();
         keys.sort_unstable();
         keys.into_iter()
-            .map(|k| {
-                let status = match map.get(&k) {
-                    Some(NodeStatus::Alive) => "Alive",
-                    Some(NodeStatus::Dead) => "Dead",
-                    None => "Unknown",
-                };
-                format!("{k} {status}")
-            })
+            .map(|k| format!("{}={:?}", k, map.get(&k).cloned().unwrap_or(NodeStatus::Alive)))
             .collect()
-    }
-
-    /// Optional: CSV snapshot (e.g., for logging or future APIs)
-    pub async fn current_netmap_entries_csv(&self) -> String {
-        let map = self.network_nodes.read().await;
-        serialize_entries(&map)
     }
 
     pub async fn forward_invest_hop(

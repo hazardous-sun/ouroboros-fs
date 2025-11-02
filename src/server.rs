@@ -2,7 +2,7 @@ use std::{error, sync::Arc, time::Duration, path::PathBuf};
 use std::path::Path;
 use tokio::fs;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -81,6 +81,8 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                     handle_push_file(&node, &mut reader, &mut writer, size, name).await?,
                 Command::FileHop { token, start_addr, size, name } =>
                     handle_file_hop(&node, &mut reader, &mut writer, token, start_addr, size, name).await?,
+                Command::FilePipeHop { token, start_addr, file_size, parts, index, name } =>
+                    handle_file_pipe_hop(&node, &mut reader, &mut writer, token, start_addr, file_size, parts, index, name).await?,
 
                 // LIST (local)
                 Command::ListFiles =>
@@ -300,6 +302,24 @@ async fn handle_netmap_get<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/* -------- FILE CHUNKING helpers -------- */
+
+fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
+    // Distribute remainder to the first (total_size % parts) chunks
+    let base = total_size / parts as u64;
+    let rem = total_size % parts as u64;
+    if (index as u64) < rem { base + 1 } else { base }
+}
+
+fn sum_len_up_to_inclusive(index: u32, total_size: u64, parts: u32) -> u64 {
+    (0..=index).map(|i| fair_chunk_len(i, total_size, parts)).sum()
+}
+
+fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
+    let safe = sanitize_filename(name);
+    format!("{}.part-{:03}-of-{:03}", safe, index + 1, parts)
+}
+
 /* -------- FILE: PUSH / HOP handlers -------- */
 
 async fn handle_push_file<R, W>(
@@ -313,48 +333,52 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let name = Path::new(&name).file_name().unwrap().to_str().unwrap();
-    // Ensure we have a next hop (so the ring is valid)
-    let Some(_next) = node.get_next().await else {
+    let name = Path::new(&name).file_name().unwrap().to_str().unwrap().to_string();
+
+    // Determine how many parts to split into: number of known nodes (fallback to 1)
+    let parts: u32 = node.network_size().await as u32;
+
+    // Update local file_tags (start, size)
+    let start_port_num: u16 = port_str(&node.port).parse().unwrap_or(0);
+    node.set_file_tag(&name, start_port_num, size).await;
+
+    if parts == 1 {
+        // Single node: read everything and store locally
+        let mut buf = vec![0u8; size as usize];
+        reader.read_exact(&mut buf).await?;
+        let _ = save_into_node_dir(node, &name, &buf).await?;
+        writer.write_all(format!("FILE {} bytes '{}' stored locally\nOK\n", size, name).as_bytes()).await?;
+        return Ok(());
+    }
+
+    // We need a next hop
+    let Some(next) = node.get_next().await else {
         writer.write_all(b"ERR no next hop set\n").await?;
-        // Drain bytes to keep connection sane
+        // Drain the stream to keep protocol in sync
         let mut sink = vec![0u8; size as usize];
         reader.read_exact(&mut sink).await?;
         return Ok(());
     };
 
-    // Read exactly `size` bytes from client
-    let mut buf = vec![0u8; size as usize];
-    reader.read_exact(&mut buf).await?;
+    let first_len = fair_chunk_len(0, size, parts);
+    // Read and save this node's first chunk
+    let mut first = vec![0u8; first_len as usize];
+    reader.read_exact(&mut first).await?;
+    let saved_as = save_into_node_dir(node, &chunk_file_name(&name, 0, parts), &first).await?;
+    println!("[{}] saved chunk 1/{parts}: {} ({} bytes)", node.port, saved_as.display(), first_len);
 
-    // Store locally under nodes/<port>/<name>
-    let saved_as = save_into_node_dir(node, &name, &buf).await?;
-
-    // Prepare token & waiter
+    // Open connection to next and stream the remaining bytes
+    let mut s = TcpStream::connect(&next).await?;
     let token = node.make_file_token();
-    let rx = node.register_file(&token).await;
+    let header = format!("FILE PIPE HOP {} {} {} {} {} {}\n",
+                         token, &node.port, size, parts, 1, name);
+    s.write_all(header.as_bytes()).await?;
 
-    // Forward around the ring
-    if let Err(e) = node.forward_file_hop(&token, &node.port, size, &name, &buf).await {
-        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
-        return Ok(());
-    }
+    // Forward exactly the remaining bytes (size - first_len) from client -> next
+    let mut limited = reader.take(size - first_len);
+    copy(&mut limited, &mut s).await?;
 
-    // Wait up to 60s for loop completion (file returns to start)
-    match tokio::time::timeout(Duration::from_secs(60), rx).await {
-        Ok(Ok(())) => {
-            writer
-                .write_all(
-                    format!("FILE {} bytes '{}' shared with all nodes\nOK\n", size, name)
-                        .as_bytes(),
-                )
-                .await?;
-            println!("[{}] file shared: {} ({} bytes) -> {}", node.port, name, size, saved_as.display());
-        }
-        Ok(Err(_)) => { writer.write_all(b"ERR file share canceled\n").await?; }
-        Err(_) => { writer.write_all(b"ERR file share timeout\n").await?; }
-    }
-
+    writer.write_all(format!("FILE {} bytes split into {} chunks and distributed\nOK\n", size, parts).as_bytes()).await?;
     Ok(())
 }
 
@@ -395,6 +419,60 @@ where
     }
 
     let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+async fn handle_file_pipe_hop<R, W>(
+    node: &Node,
+    reader: &mut R,
+    writer: &mut W,
+    token: String,
+    start_addr: String,
+    file_size: u64,
+    parts: u32,
+    index: u32,
+    name: String,
+) -> Result<(), AnyErr>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if index >= parts {
+        writer.write_all(b"ERR bad FILE PIPE index\n").await?;
+        return Ok(());
+    }
+
+    // Compute my chunk length and read exactly those bytes
+    let my_len = fair_chunk_len(index, file_size, parts);
+    let mut buf = vec![0u8; my_len as usize];
+    reader.read_exact(&mut buf).await?;
+
+    // Tag the file on this node too
+    let start_port_num: u16 = port_str(&start_addr).parse().unwrap_or(0);
+    node.set_file_tag(&name, start_port_num, file_size).await;
+
+    // Save my chunk locally
+    let saved_as = save_into_node_dir(node, &chunk_file_name(&name, index, parts), &buf).await?;
+    println!("[{}] saved chunk {}/{}: {} ({} bytes)", node.port, index + 1, parts, saved_as.display(), my_len);
+
+    // If not the last chunk, forward remaining bytes to next with index+1
+    let consumed = sum_len_up_to_inclusive(index, file_size, parts);
+    let remaining = file_size - consumed;
+    if remaining > 0 {
+        if let Some(next) = node.get_next().await {
+            let mut s = TcpStream::connect(&next).await?;
+            let header = format!("FILE PIPE HOP {} {} {} {} {} {}\n",
+                                 token, start_addr, file_size, parts, index + 1, name);
+            s.write_all(header.as_bytes()).await?;
+            let mut limited = reader.take(remaining);
+            copy(&mut limited, &mut s).await?;
+        }
+    } else {
+        // nothing left to do
+        let _ = node.finish_file(&token).await;
+    }
+
+    writer.write_all(b"OK\n").await?;
     Ok(())
 }
 
