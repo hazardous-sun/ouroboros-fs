@@ -20,8 +20,13 @@
 //!   - "FILE HOP <token> <start_addr> <size> <name>"     (node -> node)
 //!   - "FILE PIPE HOP <token> <start_addr> <file_size> <parts> <index> <name>"
 //!
-//! Local listing:
-//!   - "LIST_FILES"                                      (client -> any node)
+//! File listing:
+//!   - "LIST_FILES"  (client -> any; returns CSV from in-memory tags)
+//!
+//! File retrieval (client orchestrated via node-to-node chunk fetch):
+//!   - "GET_FILE <name>"                 (client -> any node)
+//!   - "CHUNK GET <name>"                (node -> node)
+//!   - "CHUNK RESP <next_addr> <size> <name>"  (header line before <size> raw bytes)
 //!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
@@ -32,54 +37,25 @@ pub enum Command {
     // Core verbs
     SetNext(String), // SET_NEXT <addr>
     Get,             // GET
-    Ring {
-        ttl: u32,
-        msg: String,
-    }, // RING <ttl> <message...>
+    Ring { ttl: u32, msg: String }, // RING <ttl> <message...>
 
     // WALK verbs
     WalkStart, // "WALK"
-    WalkHop {
-        token: String,
-        start_addr: String,
-        history: String,
-    }, // "WALK HOP ..."
-    WalkDone {
-        token: String,
-        history: String,
-    }, // "WALK DONE ..."
+    WalkHop { token: String, start_addr: String, history: String },
+    WalkDone { token: String, history: String },
 
     // INVESTIGATION verbs
     InvestigateStart, // "INVESTIGATE"
-    InvestigateHop {
-        token: String,
-        start_addr: String,
-        entries: String, // "7002=Alive,7003=Alive"
-    }, // "INVEST HOP ..."
-    InvestigateDone {
-        token: String,
-        entries: String,
-    }, // "INVEST DONE ..."
+    InvestigateHop { token: String, start_addr: String, entries: String },
+    InvestigateDone { token: String, entries: String },
 
     // Broadcast full map to all nodes
-    NetmapSet {
-        entries: String,
-    }, // "NETMAP SET <entries>"
-    NetmapGet,       // "NETMAP GET"
+    NetmapSet { entries: String }, // "NETMAP SET <entries>"
+    NetmapGet,                     // "NETMAP GET"
 
     // FILE verbs
-    PushFile {
-        size: u64,
-        name: String,
-    }, // client -> start
-    FileHop {
-        token: String,
-        start_addr: String,
-        size: u64,
-        name: String,
-    }, // node -> node
-
-    // New chunk-pipeline hop: stream remaining bytes across the ring
+    PushFile { size: u64, name: String }, // client -> start
+    FileHop { token: String, start_addr: String, size: u64, name: String }, // node -> node
     FilePipeHop {
         token: String,
         start_addr: String,
@@ -91,6 +67,10 @@ pub enum Command {
 
     // LIST (local)
     ListFiles, // "LIST_FILES"
+
+    // FILE retrieval
+    GetFile { name: String }, // "GET_FILE <name>" (client -> any)
+    ChunkGet { name: String }, // "CHUNK GET <name>" (node -> node)
 }
 
 /// Parse one incoming line from the wire into a Command.
@@ -131,15 +111,23 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     // FILE PUSH / HOP
     if let Ok(cmd) = push_file(trimmed) { return Ok(cmd); }
     if let Ok(cmd) = file_hop(trimmed) { return Ok(cmd); }
-
-    // FILE PIPE HOP <token> <start_addr> <file_size> <parts> <index> <name>
-    if let Ok(cmd) = file_pipe_hop(trimmed) {
-        return Ok(cmd);
-    }
+    if let Ok(cmd) = file_pipe_hop(trimmed) { return Ok(cmd); }
 
     // LIST_FILES
     if trimmed.eq_ignore_ascii_case("LIST_FILES") {
         return Ok(Command::ListFiles);
+    }
+
+    // FILE retrieval
+    if let Some(rest) = trimmed.strip_prefix("GET_FILE ") {
+        let name = rest.to_string();
+        if name.trim().is_empty() { return Err("missing file name".into()); }
+        return Ok(Command::GetFile { name });
+    }
+    if let Some(rest) = trimmed.strip_prefix("CHUNK GET ") {
+        let name = rest.to_string();
+        if name.trim().is_empty() { return Err("missing file name".into()); }
+        return Ok(Command::ChunkGet { name });
     }
 
     Err("unknown command".into())

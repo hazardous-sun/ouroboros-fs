@@ -77,7 +77,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 Command::NetmapGet =>
                     handle_netmap_get(&node, &mut writer).await?,
 
-                // FILE
+                // FILE (push / hop / pipeline)
                 Command::PushFile { size, name } =>
                     handle_push_file(&node, &mut reader, &mut writer, size, name).await?,
                 Command::FileHop { token, start_addr, size, name } =>
@@ -85,9 +85,15 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 Command::FilePipeHop { token, start_addr, file_size, parts, index, name } =>
                     handle_file_pipe_hop(&node, &mut reader, &mut writer, token, start_addr, file_size, parts, index, name).await?,
 
-                // LIST (now returns CSV from file_tags)
+                // LIST (CSV from in-memory tags)
                 Command::ListFiles =>
                     handle_list_files_csv(&node, &mut writer).await?,
+
+                // FILE retrieval
+                Command::GetFile { name } =>
+                    handle_get_file(&node, &mut writer, name).await?,
+                Command::ChunkGet { name } =>
+                    handle_chunk_get(&node, &mut writer, name).await?,
             },
             Err(e) => handle_error(&mut writer, e).await?,
         }
@@ -477,13 +483,134 @@ where
     Ok(())
 }
 
+/* -------- FILE RETRIEVAL (GET_FILE / CHUNK GET) -------- */
+
+async fn handle_get_file<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    name: String,
+) -> Result<(), AnyErr> {
+    let tags = node.file_tags.read().await;
+    let Some(tag) = tags.get(&name) else {
+        writer.write_all(b"ERR file not found\n").await?;
+        return Ok(());
+    };
+    let start_port = tag.start;
+    let start_addr = format!("{}:{}", host_of(&node.port), start_port);
+    drop(tags);
+
+    // Assemble full file by walking the ring starting at start_addr
+    let bytes = pull_file_from_ring(node, &name, &start_addr).await?;
+
+    // IMPORTANT: return *pure bytes*, no textual header or trailer.
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn handle_chunk_get<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    name: String,
+) -> Result<(), AnyErr> {
+    let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
+    let chunk = read_local_chunk_bytes(node, &name).await.unwrap_or_default();
+
+    // Header + exact bytes for node-to-node transfer
+    writer
+        .write_all(format!("CHUNK RESP {} {} {}\n", next, chunk.len(), name).as_bytes())
+        .await?;
+    writer.write_all(&chunk).await?;
+    Ok(())
+}
+
+/* --- GET_FILE helpers --- */
+
+async fn pull_file_from_ring(node: &Node, name: &str, start_addr: &str) -> Result<Vec<u8>, AnyErr> {
+    let start_port = port_str(start_addr).to_string();
+    let mut out = Vec::new();
+
+    let mut current = start_addr.to_string();
+
+    loop {
+        let curr_port = port_str(&current).to_string();
+
+        // Fetch chunk from `current` (local fast-path)
+        let (chunk, next_addr) = if curr_port == port_str(&node.port) {
+            let bytes = read_local_chunk_bytes(node, name).await.unwrap_or_default();
+            let next = node.get_next().await.unwrap_or_else(|| current.clone());
+            (bytes, next)
+        } else {
+            request_chunk_from(&current, name).await?
+        };
+
+        out.extend_from_slice(&chunk);
+
+        // Decide whether to continue
+        if port_str(&next_addr) == start_port {
+            break;
+        }
+        current = next_addr;
+    }
+
+    Ok(out)
+}
+
+async fn request_chunk_from(addr: &str, name: &str) -> Result<(Vec<u8>, String), AnyErr> {
+    let mut s = TcpStream::connect(addr).await?;
+    s.write_all(format!("CHUNK GET {}\n", name).as_bytes()).await?;
+
+    let (r, mut w) = s.into_split();
+    let mut reader = BufReader::new(r);
+
+    // Parse: CHUNK RESP <next_addr> <size> <name>\n
+    let mut header = String::new();
+    reader.read_line(&mut header).await?;
+    let header = header.trim_end_matches(['\r', '\n']);
+
+    let rest = header
+        .strip_prefix("CHUNK RESP ")
+        .ok_or_else(|| "malformed CHUNK RESP".to_string())?;
+    let mut parts = rest.splitn(3, ' ');
+    let next_addr = parts.next().unwrap_or("").to_string();
+    let size_str = parts.next().unwrap_or("");
+    let _name_echo = parts.next().unwrap_or("").to_string();
+
+    let size: usize = size_str.parse().map_err(|_| "invalid chunk size".to_string())?;
+    let mut buf = vec![0u8; size];
+    reader.read_exact(&mut buf).await?;
+
+    // ensure writer not dropped too early
+    let _ = (&mut w).shutdown().await;
+
+    Ok((buf, next_addr))
+}
+
+async fn read_local_chunk_bytes(node: &Node, name: &str) -> Result<Vec<u8>, AnyErr> {
+    // Look for "<name>.part-*-of-*" inside nodes/<port>/
+    let dir = format!("nodes/{}", port_str(&node.port));
+    let safe_prefix = format!("{}.", sanitize_filename(name));
+
+    let mut rd = fs::read_dir(&dir).await?;
+    while let Some(ent) = rd.next_entry().await? {
+        let ft = ent.file_type().await?;
+        if !ft.is_file() { continue; }
+        let fname = ent.file_name();
+        let fname = fname.to_string_lossy();
+        if fname.starts_with(&safe_prefix) && fname.contains(".part-") && fname.contains("-of-") {
+            let path = ent.path();
+            return Ok(fs::read(path).await?);
+        }
+    }
+    Ok(Vec::new())
+}
+
 /* -------- LIST_FILES: local-only listing -------- */
 
 async fn handle_list_files_csv<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
-    // We output *pure CSV* (header + rows). No trailing "OK" so the output is a valid CSV file.
+    // Pure CSV output (header + rows). No trailing "OK".
     writer.write_all(b"name,start,size\n").await?;
 
     let tags = node.file_tags.read().await;
@@ -539,4 +666,8 @@ fn csv_escape(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn host_of(addr: &str) -> &str {
+    addr.split(':').next().unwrap_or("127.0.0.1")
 }
