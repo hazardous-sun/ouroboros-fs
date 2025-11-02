@@ -63,6 +63,18 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                 Command::WalkDone { token, history } =>
                     handle_walk_done(&node, &mut writer, token, history).await?,
 
+                // INVESTIGATION / NETMAP
+                Command::InvestigateStart =>
+                    handle_investigate_start(&node, &mut writer).await?,
+                Command::InvestigateHop { token, start_addr, entries } =>
+                    handle_investigate_hop(&node, &mut writer, token, start_addr, entries).await?,
+                Command::InvestigateDone { token, entries } =>
+                    handle_investigate_done(&node, &mut writer, token, entries).await?,
+                Command::NetmapSet { entries } =>
+                    handle_netmap_set(&node, &mut writer, entries).await?,
+                Command::NetmapGet =>
+                    handle_netmap_get(&node, &mut writer).await?,
+
                 // FILE
                 Command::PushFile { size, name } =>
                     handle_push_file(&node, &mut reader, &mut writer, size, name).await?,
@@ -191,6 +203,99 @@ async fn handle_walk_done<W: AsyncWrite + Unpin>(
 ) -> Result<(), AnyErr> {
     let _ = node.finish_walk(&token, history).await;
     let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+/* -------- INVESTIGATION / NETMAP -------- */
+
+async fn handle_investigate_start<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    let token = node.make_invest_token();
+
+    let Some(_next) = node.get_next().await else {
+        writer.write_all(b"ERR no next hop set\n").await?;
+        return Ok(());
+    };
+
+    // entries begins with "my_port=Alive"
+    let entries = format!("{}=Alive", port_str(&node.port));
+    if let Err(e) = node.forward_invest_hop(&token, &node.port, &entries).await {
+        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
+        return Ok(());
+    }
+
+    // We don't need to wait here; it's a background ring discovery.
+    writer.write_all(b"OK\n").await?;
+    Ok(())
+}
+
+async fn handle_investigate_hop<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    token: String,
+    start_addr: String,
+    entries: String,
+) -> Result<(), AnyErr> {
+    let Some(next_addr) = node.get_next().await else {
+        let _ = writer.write_all(b"OK\n").await;
+        return Ok(());
+    };
+
+    let new_entries = node.entries_with_self(&entries);
+
+    if port_str(&next_addr) == port_str(&start_addr) {
+        if let Err(e) = node.send_invest_done(&start_addr, &token, &new_entries).await {
+            eprintln!("[{}] INVEST DONE send failed to {}: {}", node.port, start_addr, e);
+        }
+    } else {
+        if let Err(e) = node.forward_invest_hop(&token, &start_addr, &new_entries).await {
+            eprintln!("[{}] INVEST forward failed to {}: {}", node.port, next_addr, e);
+        }
+    }
+
+    let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+async fn handle_investigate_done<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    _token: String,
+    entries: String,
+) -> Result<(), AnyErr> {
+    // Persist locally, then broadcast to all nodes
+    node.set_network_nodes_from_entries(&entries).await;
+    node.broadcast_netmap(&entries).await;
+
+    let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+async fn handle_netmap_set<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    entries: String,
+) -> Result<(), AnyErr> {
+    node.set_network_nodes_from_entries(&entries).await;
+    let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+async fn handle_netmap_get<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    let lines = node.get_network_nodes_lines().await;
+    if lines.is_empty() {
+        writer.write_all(b"(empty)\n").await?;
+    } else {
+        for l in lines {
+            writer.write_all(format!("{l}\n").as_bytes()).await?;
+        }
+    }
+    writer.write_all(b"OK\n").await?;
     Ok(())
 }
 

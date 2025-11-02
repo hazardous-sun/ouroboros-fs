@@ -1,14 +1,15 @@
+use crate::NodeStatus;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
-    sync::{oneshot, RwLock},
+    sync::{RwLock, oneshot},
 };
 
 /// Shared node state & actions.
@@ -31,10 +32,15 @@ pub struct Node {
     // FILE pending acks (start node only)
     pending_files: RwLock<HashMap<String, oneshot::Sender<()>>>,
     file_counter: AtomicU64,
+
+    /// Status of all nodes on the network
+    network_nodes: RwLock<HashMap<String, NodeStatus>>,
 }
 
 impl Node {
     pub fn new(port: String) -> Arc<Self> {
+        let network_nodes = RwLock::new(HashMap::new());
+
         Arc::new(Self {
             port,
             next_port: RwLock::new(None),
@@ -42,6 +48,7 @@ impl Node {
             walk_counter: AtomicU64::new(1),
             pending_files: RwLock::new(HashMap::new()),
             file_counter: AtomicU64::new(1),
+            network_nodes,
         })
     }
 
@@ -81,7 +88,10 @@ impl Node {
 
     pub async fn register_walk(&self, token: &str) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
-        self.pending_walks.write().await.insert(token.to_string(), tx);
+        self.pending_walks
+            .write()
+            .await
+            .insert(token.to_string(), tx);
         rx
     }
 
@@ -133,7 +143,10 @@ impl Node {
 
     pub async fn register_file(&self, token: &str) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        self.pending_files.write().await.insert(token.to_string(), tx);
+        self.pending_files
+            .write()
+            .await
+            .insert(token.to_string(), tx);
         rx
     }
 
@@ -187,5 +200,132 @@ impl Node {
     pub async fn first_walk_history(&self) -> Option<String> {
         let next = self.get_next().await?;
         Some(append_edge(String::new(), &self.port, &next))
+    }
+}
+
+/* ---------- INVESTIGATION helpers & netmap ---------- */
+
+fn host_str(addr: &str) -> &str {
+    addr.split(':').next().unwrap_or("127.0.0.1")
+}
+
+fn parse_entries(entries: &str) -> HashMap<String, NodeStatus> {
+    let mut map = HashMap::new();
+    for part in entries.split(',') {
+        let kv = part.trim();
+        if kv.is_empty() {
+            continue;
+        }
+        let mut it = kv.splitn(2, '=');
+        let k = it.next().unwrap_or("").trim();
+        let v = it.next().unwrap_or("").trim();
+        if k.is_empty() {
+            continue;
+        }
+        let status = match v {
+            "Alive" | "alive" => NodeStatus::Alive,
+            "Dead" | "dead" => NodeStatus::Dead,
+            _ => NodeStatus::Alive,
+        };
+        map.insert(k.to_string(), status);
+    }
+    map
+}
+
+fn serialize_entries(map: &HashMap<String, NodeStatus>) -> String {
+    let mut keys: Vec<_> = map.keys().cloned().collect();
+    keys.sort_unstable();
+    let mut out = String::new();
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push_str(match map.get(k) {
+            Some(NodeStatus::Alive) => "Alive",
+            Some(NodeStatus::Dead) => "Dead",
+            None => "Alive",
+        });
+    }
+    out
+}
+
+impl Node {
+    pub fn make_invest_token(&self) -> String {
+        // Reuse the monotonic counter; only uniqueness matters
+        self.next_token()
+    }
+
+    pub fn entries_with_self(&self, entries: &str) -> String {
+        let mut map = parse_entries(entries);
+        map.insert(port_str(&self.port).to_string(), NodeStatus::Alive);
+        serialize_entries(&map)
+    }
+
+    pub async fn set_network_nodes_from_entries(&self, entries: &str) {
+        let map = parse_entries(entries);
+        *self.network_nodes.write().await = map;
+    }
+
+    /// NEW: Human-friendly lines for "NETMAP GET"
+    pub async fn get_network_nodes_lines(&self) -> Vec<String> {
+        let map = self.network_nodes.read().await;
+        let mut keys: Vec<_> = map.keys().cloned().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|k| {
+                let status = match map.get(&k) {
+                    Some(NodeStatus::Alive) => "Alive",
+                    Some(NodeStatus::Dead) => "Dead",
+                    None => "Unknown",
+                };
+                format!("{k} {status}")
+            })
+            .collect()
+    }
+
+    /// Optional: CSV snapshot (e.g., for logging or future APIs)
+    pub async fn current_netmap_entries_csv(&self) -> String {
+        let map = self.network_nodes.read().await;
+        serialize_entries(&map)
+    }
+
+    pub async fn forward_invest_hop(
+        &self,
+        token: &str,
+        start_addr: &str,
+        entries: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(next) = self.get_next().await {
+            let mut s = TcpStream::connect(&next).await?;
+            let line = format!("INVEST HOP {} {} {}\n", token, start_addr, entries);
+            s.write_all(line.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_invest_done(
+        &self,
+        start_addr: &str,
+        token: &str,
+        entries: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut s = TcpStream::connect(start_addr).await?;
+        let line = format!("INVEST DONE {} {}\n", token, entries);
+        s.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn broadcast_netmap(&self, entries: &str) {
+        let map = parse_entries(entries);
+        let host = host_str(&self.port).to_string();
+        for port in map.keys() {
+            let addr = format!("{}:{}", host, port);
+            if let Ok(mut s) = TcpStream::connect(&addr).await {
+                let line = format!("NETMAP SET {}\n", entries);
+                let _ = s.write_all(line.as_bytes()).await;
+            }
+        }
     }
 }

@@ -9,7 +9,11 @@ use tokio::{
 };
 
 #[derive(Parser)]
-#[command(name = "rust_socket_server", version, about = "Ring TCP server & tools")]
+#[command(
+    name = "rust_socket_server",
+    version,
+    about = "Ring TCP server & tools"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -61,7 +65,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             host,
             no_block,
             wait_ms,
-        } => set_network(nodes, base_port, &host, !no_block, Duration::from_millis(wait_ms)).await,
+        } => {
+            set_network(
+                nodes,
+                base_port,
+                &host,
+                !no_block,
+                Duration::from_millis(wait_ms),
+            )
+            .await
+        }
     }
 }
 
@@ -167,6 +180,14 @@ async fn set_network(
 
     println!("ring wired successfully.");
 
+    // 4.5) Kick off a full investigation from the first node
+    let start_addr = format!("{host}:{base_port}");
+    if let Err(e) = send_investigate(&start_addr).await {
+        eprintln!("failed to start investigation from {start_addr}: {e}");
+    } else {
+        println!("started full investigation from {start_addr}");
+    }
+
     // 5) Optionally block until user quits / Ctrl-C
     if block {
         println!("type 'quit' or press Ctrl-C to stop…");
@@ -206,7 +227,10 @@ async fn wait_until_listening(
     }
 }
 
-async fn send_set_next(this_addr: &str, next_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn send_set_next(
+    this_addr: &str,
+    next_addr: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut s = TcpStream::connect(this_addr).await?;
     let line = format!("SET_NEXT {next_addr}\n");
     s.write_all(line.as_bytes()).await?;
@@ -224,6 +248,16 @@ async fn send_set_next(this_addr: &str, next_addr: &str) -> Result<(), Box<dyn E
     if !(upper == "OK" || upper.starts_with("OK ")) {
         return Err(format!("unexpected response to SET_NEXT from {this_addr}: {buf}").into());
     }
+    Ok(())
+}
+
+async fn send_investigate(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut s = TcpStream::connect(start_addr).await?;
+    s.write_all(b"INVESTIGATE\n").await?;
+    // we don't need to wait; but try a tiny ACK read (best-effort)
+    let mut reader = BufReader::new(s);
+    let mut buf = String::new();
+    let _ = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut buf)).await;
     Ok(())
 }
 

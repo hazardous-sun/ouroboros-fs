@@ -8,6 +8,13 @@
 //!   - "WALK HOP <token> <start> <hist>"   (node -> node; single line)
 //!   - "WALK DONE <token> <hist>"          (last node -> start)
 //!
+//! Discovery / netmap (line-only, csv-ish payload):
+//!   - "INVESTIGATE"                                        (client/tool -> start)
+//!   - "INVEST HOP <token> <start_addr> <entries>"          (node -> node)
+//!   - "INVEST DONE <token> <entries>"                      (last node -> start)
+//!   - "NETMAP SET <entries>"                               (start -> every node)
+//!   - "NETMAP GET"                                         (client -> any node; prints map)
+//!
 //! File transfer (line header + exact number of binary bytes):
 //!   - "PUSH_FILE <size> <name>"                         (client -> start)
 //!   - "FILE HOP <token> <start_addr> <size> <name>"     (node -> node)
@@ -40,6 +47,24 @@ pub enum Command {
         token: String,
         history: String,
     }, // "WALK DONE ..."
+
+    // INVESTIGATION verbs
+    InvestigateStart, // "INVESTIGATE"
+    InvestigateHop {
+        token: String,
+        start_addr: String,
+        entries: String, // "7002=Alive,7003=Alive"
+    }, // "INVEST HOP ..."
+    InvestigateDone {
+        token: String,
+        entries: String,
+    }, // "INVEST DONE ..."
+
+    // Broadcast full map to all nodes
+    NetmapSet {
+        entries: String,
+    }, // "NETMAP SET <entries>"
+    NetmapGet,       // "NETMAP GET"
 
     // FILE verbs
     PushFile {
@@ -89,6 +114,31 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     // WALK DONE <token> <history>
     if let Ok(cmd) = walk_done(trimmed) {
         return Ok(cmd);
+    }
+
+    // INVESTIGATE
+    if trimmed == "INVESTIGATE" {
+        return Ok(Command::InvestigateStart);
+    }
+
+    // INVEST HOP <token> <start_addr> <entries>
+    if let Ok(cmd) = invest_hop(trimmed) {
+        return Ok(cmd);
+    }
+
+    // INVEST DONE <token> <entries>
+    if let Ok(cmd) = invest_done(trimmed) {
+        return Ok(cmd);
+    }
+
+    // NETMAP SET <entries>
+    if let Some(rest) = trimmed.strip_prefix("NETMAP SET ") {
+        return Ok(Command::NetmapSet { entries: rest.to_string() });
+    }
+
+    // NETMAP GET
+    if trimmed == "NETMAP GET" {
+        return Ok(Command::NetmapGet);
     }
 
     // PUSH_FILE <size> <name>
@@ -160,6 +210,40 @@ fn walk_done(trimmed: &str) -> Result<Command, String> {
         return Ok(Command::WalkDone {
             token: token.to_string(),
             history,
+        });
+    }
+    Err("wrong command".into())
+}
+
+fn invest_hop(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("INVEST HOP ") {
+        let mut parts = rest.splitn(3, ' ');
+        let token = parts.next().unwrap_or("").trim();
+        let start_addr = parts.next().unwrap_or("").trim();
+        let entries = parts.next().unwrap_or("").to_string();
+        if token.is_empty() || start_addr.is_empty() {
+            return Err("malformed INVEST HOP".into());
+        }
+        return Ok(Command::InvestigateHop {
+            token: token.to_string(),
+            start_addr: start_addr.to_string(),
+            entries,
+        });
+    }
+    Err("wrong command".into())
+}
+
+fn invest_done(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("INVEST DONE ") {
+        let mut parts = rest.splitn(2, ' ');
+        let token = parts.next().unwrap_or("").trim();
+        let entries = parts.next().unwrap_or("").to_string();
+        if token.is_empty() {
+            return Err("malformed INVEST DONE".into());
+        }
+        return Ok(Command::InvestigateDone {
+            token: token.to_string(),
+            entries,
         });
     }
     Err("wrong command".into())
