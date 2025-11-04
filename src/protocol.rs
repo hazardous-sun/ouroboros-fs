@@ -89,29 +89,13 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     if let Ok(cmd) = ring(trimmed) { return Ok(cmd); }
 
     // WALK
-    if trimmed.eq_ignore_ascii_case("WALK") {
-        return Ok(Command::WalkStart);
-    }
-    if let Ok(cmd) = walk_hop(trimmed) { return Ok(cmd); }
-    if let Ok(cmd) = walk_done(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = walk(trimmed) { return Ok(cmd); }
 
     // INVESTIGATE / NETMAP
-    if trimmed.eq_ignore_ascii_case("INVESTIGATE") {
-        return Ok(Command::InvestigateStart);
-    }
-    if let Ok(cmd) = invest_hop(trimmed) { return Ok(cmd); }
-    if let Ok(cmd) = invest_done(trimmed) { return Ok(cmd); }
-    if let Some(rest) = trimmed.strip_prefix("NETMAP SET ") {
-        return Ok(Command::NetmapSet { entries: rest.trim().to_string() });
-    }
-    if trimmed.eq_ignore_ascii_case("NETMAP GET") {
-        return Ok(Command::NetmapGet);
-    }
+    if let Ok(cmd) = investigate(trimmed) { return Ok(cmd); }
 
     // FILE PUSH / HOP
-    if let Ok(cmd) = push_file(trimmed) { return Ok(cmd); }
-    if let Ok(cmd) = file_hop(trimmed) { return Ok(cmd); }
-    if let Ok(cmd) = file_pipe_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = file_push(trimmed) { return Ok(cmd); }
 
     // LIST_FILES
     if trimmed.eq_ignore_ascii_case("LIST_FILES") {
@@ -119,16 +103,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
     }
 
     // FILE retrieval
-    if let Some(rest) = trimmed.strip_prefix("GET_FILE ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() { return Err("missing file name".into()); }
-        return Ok(Command::GetFile { name });
-    }
-    if let Some(rest) = trimmed.strip_prefix("CHUNK GET ") {
-        let name = rest.to_string();
-        if name.trim().is_empty() { return Err("missing file name".into()); }
-        return Ok(Command::ChunkGet { name });
-    }
+    if let Ok(cmd) = file_retrieval(trimmed) { return Ok(cmd); }
 
     Err("unknown command".into())
 }
@@ -155,6 +130,15 @@ fn ring(trimmed: &str) -> Result<Command, String> {
         return Ok(Command::Ring { ttl, msg });
     }
     Err("wrong command".into())
+}
+
+fn walk(trimmed: &str) -> Result<Command, String> {
+    if trimmed.eq_ignore_ascii_case("WALK") {
+        return Ok(Command::WalkStart);
+    }
+    if let Ok(cmd) = walk_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = walk_done(trimmed) { return Ok(cmd); }
+    return Err("wrong command".into());
 }
 
 fn walk_hop(trimmed: &str) -> Result<Command, String> {
@@ -191,6 +175,21 @@ fn walk_done(trimmed: &str) -> Result<Command, String> {
     Err("wrong command".into())
 }
 
+fn investigate(trimmed: &str) -> Result<Command, String> {
+    if trimmed.eq_ignore_ascii_case("INVESTIGATE") {
+        return Ok(Command::InvestigateStart);
+    }
+    if let Ok(cmd) = invest_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = invest_done(trimmed) { return Ok(cmd); }
+    if let Some(rest) = trimmed.strip_prefix("NETMAP SET ") {
+        return Ok(Command::NetmapSet { entries: rest.trim().to_string() });
+    }
+    if trimmed.eq_ignore_ascii_case("NETMAP GET") {
+        return Ok(Command::NetmapGet);
+    }
+    return Err("wrong command".into());
+}
+
 fn invest_hop(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("INVEST HOP ") {
         let mut parts = rest.splitn(3, ' ');
@@ -225,6 +224,13 @@ fn invest_done(trimmed: &str) -> Result<Command, String> {
     Err("wrong command".into())
 }
 
+fn file_push(trimmed: &str) -> Result<Command, String> {
+    if let Ok(cmd) = push_file(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = file_hop(trimmed) { return Ok(cmd); }
+    if let Ok(cmd) = file_pipe_hop(trimmed) { return Ok(cmd); }
+    Err("wrong command".into())
+}
+
 fn push_file(trimmed: &str) -> Result<Command, String> {
     if let Some(rest) = trimmed.strip_prefix("PUSH_FILE ") {
         let mut parts = rest.splitn(2, ' ');
@@ -235,6 +241,20 @@ fn push_file(trimmed: &str) -> Result<Command, String> {
         }
         let size = size_str.parse::<u64>().map_err(|_| "invalid size")?;
         return Ok(Command::PushFile { size, name });
+    }
+    Err("wrong command".into())
+}
+
+fn file_retrieval(trimmed: &str) -> Result<Command, String> {
+    if let Some(rest) = trimmed.strip_prefix("GET_FILE ") {
+        let name = rest.to_string();
+        if name.trim().is_empty() { return Err("missing file name".into()); }
+        return Ok(Command::GetFile { name });
+    }
+    if let Some(rest) = trimmed.strip_prefix("CHUNK GET ") {
+        let name = rest.to_string();
+        if name.trim().is_empty() { return Err("missing file name".into()); }
+        return Ok(Command::ChunkGet { name });
     }
     Err("wrong command".into())
 }
