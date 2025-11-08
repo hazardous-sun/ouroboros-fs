@@ -23,15 +23,15 @@ struct Cli {
 enum Cmd {
     /// Run a single node (server)
     Run {
-        /// Address to bind (e.g., 127.0.0.1:7000). If omitted, see --port / $PORT / default.
+        /// Address to bind. If omitted, see --port, then $PORT, then default.
         #[arg(long)]
         addr: Option<String>,
-        /// Convenience: provide only the port; host defaults to 127.0.0.1
+        /// Provide only the port, and host defaults to 127.0.0.1
         #[arg(short, long)]
         port: Option<u16>,
     },
 
-    /// Spawn N nodes and stitch them into a ring (replacement for run.sh)
+    /// Spawn N nodes and stitch them into a ring
     SetNetwork {
         /// Number of nodes to start
         #[arg(short = 'n', long = "nodes", default_value_t = 3)]
@@ -39,10 +39,10 @@ enum Cmd {
         /// Base port to use (ports are base, base+1, ..., base+N-1)
         #[arg(short = 'p', long = "base-port", default_value_t = 7000)]
         base_port: u16,
-        /// Host/interface to bind and to use when wiring SET_NEXT
+        /// Interface to bind and to use when wiring SET_NEXT
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Do not block; just start and wire nodes, then return
+        /// Do not block, just start and wire nodes, then return
         #[arg(long)]
         no_block: bool,
         /// Extra wait after spawning children before wiring (ms)
@@ -81,7 +81,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 /* ------------------------- run -------------------------- */
 
 fn resolve_listen_addr(addr: Option<String>, port: Option<u16>) -> String {
-    // Priority: explicit --addr, then --port, then PORT env, else default.
+    // Priority:
+    // 1. --addr
+    // 2. --port
+    // 3. PORT env
+    // 4. default
     if let Some(a) = addr {
         return normalize_addr(a);
     }
@@ -131,7 +135,7 @@ async fn set_network(
         exe
     );
 
-    // 1) Spawn children
+    // 1. Spawn children
     let mut children: Vec<Child> = Vec::with_capacity(nodes as usize);
     for i in 0..nodes {
         let port = base_port + i;
@@ -142,8 +146,6 @@ async fn set_network(
         #[cfg(unix)]
         {
             // use std::os::unix::process::CommandExt as _;
-            // Best-effort: make children share our process group.
-            // (If this API isn't available on your toolchain it's a no-op.)
             let _ = cmd.process_group(0);
         }
 
@@ -152,19 +154,19 @@ async fn set_network(
         println!("spawned node on {addr}");
     }
 
-    // 2) Give them a moment to bind (user-configurable cushion)
+    // 2. Give nodes a moment to bind
     if extra_wait > Duration::from_millis(0) {
         tokio::time::sleep(extra_wait).await;
     }
 
-    // 3) Wait until all ports are listening (bounded wait)
+    // 3. Wait until all ports are listening
     for i in 0..nodes {
         let port = base_port + i;
         wait_until_listening(host, port, Duration::from_secs(5)).await?;
         println!("node {host}:{port} is listening");
     }
 
-    // 4) Wire the ring via NODE NEXT
+    // 4. Wire the ring
     for i in 0..nodes {
         let this_port = base_port + i;
         let next_port = if i + 1 == nodes {
@@ -180,7 +182,7 @@ async fn set_network(
 
     println!("ring wired successfully.");
 
-    // 4.5) Kick off a full investigation from the first node
+    // 5. Start a full investigation from the first node
     let start_addr = format!("{host}:{base_port}");
     if let Err(e) = send_netmap_discover(&start_addr).await {
         eprintln!("failed to start investigation from {start_addr}: {e}");
@@ -188,14 +190,14 @@ async fn set_network(
         println!("started full investigation from {start_addr}");
     }
 
-    // 5) Optionally block until user quits / Ctrl-C
+    // 6. Optionally block until user quits / Ctrl-C
     if block {
         println!("type 'quit' or press Ctrl-C to stop…");
         wait_for_quit_or_ctrl_c().await;
         println!("stopping nodes…");
     }
 
-    // 6) Cleanup
+    // 7. Cleanup
     for mut child in children {
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -219,7 +221,7 @@ async fn wait_until_listening(
             Ok(_) => return Ok(()),
             Err(_) => {
                 if start.elapsed() > deadline {
-                    return Err(format!("timeout waiting for {addr}").into());
+                    return Err(format!("timed out while waiting for {addr}").into());
                 }
                 sleep(Duration::from_millis(50)).await;
             }
@@ -235,12 +237,12 @@ async fn send_node_next(
     let line = format!("NODE NEXT {next_addr}\n");
     s.write_all(line.as_bytes()).await?;
 
-    // Best-effort ACK: accept "OK" or "OK <anything>"
+    // Accept "OK" or "OK <anything>"
     let mut reader = BufReader::new(s);
     let mut buf = String::new();
     let read = tokio::time::timeout(Duration::from_millis(150), reader.read_line(&mut buf)).await;
     if read.is_err() {
-        // It's okay if the ACK races; we still consider wiring successful.
+        // It's okay if the ACK races, we still consider wiring successful
         return Ok(());
     }
     let ack = buf.trim();
@@ -254,7 +256,6 @@ async fn send_node_next(
 async fn send_netmap_discover(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut s = TcpStream::connect(start_addr).await?;
     s.write_all(b"NETMAP DISCOVER\n").await?;
-    // we don't need to wait; but try a tiny ACK read (best-effort)
     let mut reader = BufReader::new(s);
     let mut buf = String::new();
     let _ = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut buf)).await;
