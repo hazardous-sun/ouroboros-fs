@@ -1,14 +1,14 @@
-use std::{error, sync::Arc, path::PathBuf};
 use std::path::Path;
 use std::time::Duration;
+use std::{error, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
-    node::{port_str, append_edge, Node},
+    node::{Node, append_edge, port_str},
     protocol::{self, Command},
 };
 
@@ -16,12 +16,15 @@ type AnyErr = Box<dyn error::Error + Send + Sync>;
 
 /// Run the TCP server and handle connections.
 pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
+    // Initialize TCP listener and collect its address
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
+
+    // Initialize Node structure
     let node = Node::new(local.to_string());
     println!("node listening on {}", node.port);
 
-    // Create nodes/<port> directory once this node is up
+    // Create nodes/<port> directory once the node is up
     let port_only = port_str(&node.port);
     let node_dir = format!("nodes/{}", port_only);
     if let Err(e) = fs::create_dir_all(&node_dir).await {
@@ -30,6 +33,7 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
         println!("[{}] created {}", node.port, node_dir);
     }
 
+    // Accept connections
     loop {
         let (stream, peer) = listener.accept().await?;
         let node = Arc::clone(&node);
@@ -42,8 +46,12 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
 }
 
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr> {
+    // Set read and write streams
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+
+    // The protocol is line delimited, so we just need to read the first line
+    // when figuring out how to handle the request
     let mut line = String::new();
 
     loop {
@@ -52,48 +60,93 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
             break;
         }
 
+        // Parse the header and match it with a specific command
         match protocol::parse_line(&line) {
             Ok(cmd) => match cmd {
-                Command::SetNext(addr) => handle_set_next(&node, &mut writer, addr).await?,
-                Command::Get => handle_get(&node, &mut writer).await?,
-                Command::Ring { ttl, msg } => handle_ring(&node, &mut writer, ttl, msg).await?,
+                // NODE
+                Command::NodeNext(addr) => handle_node_next(&node, &mut writer, addr).await?,
+                Command::NodeStatus => handle_node_status(&node, &mut writer).await?,
 
-                // WALK
-                Command::WalkStart => handle_walk_start(&node, &mut writer).await?,
-                Command::WalkHop { token, start_addr, history } =>
-                    handle_walk_hop(&node, &mut writer, token, start_addr, history).await?,
-                Command::WalkDone { token, history } =>
-                    handle_walk_done(&node, &mut writer, token, history).await?,
+                // RING
+                Command::RingForward { ttl, msg } => {
+                    handle_ring_forward(&node, &mut writer, ttl, msg).await?
+                }
 
-                // INVESTIGATION / NETMAP
-                Command::InvestigateStart =>
-                    handle_investigate_start(&node, &mut writer).await?,
-                Command::InvestigateHop { token, start_addr, entries } =>
-                    handle_investigate_hop(&node, &mut writer, token, start_addr, entries).await?,
-                Command::InvestigateDone { token, entries } =>
-                    handle_investigate_done(&node, &mut writer, token, entries).await?,
-                Command::NetmapSet { entries } =>
-                    handle_netmap_set(&node, &mut writer, entries).await?,
-                Command::NetmapGet =>
-                    handle_netmap_get(&node, &mut writer).await?,
+                // TOPOLOGY
+                Command::TopologyWalk => handle_topology_walk(&node, &mut writer).await?,
+                Command::TopologyHop {
+                    token,
+                    start_addr,
+                    history,
+                } => handle_topology_hop(&node, &mut writer, token, start_addr, history).await?,
+                Command::TopologyDone { token, history } => {
+                    handle_topology_done(&node, &mut writer, token, history).await?
+                }
 
-                // FILE (push / hop / pipeline)
-                Command::PushFile { size, name } =>
-                    handle_push_file(&node, &mut reader, &mut writer, size, name).await?,
-                Command::FileHop { token, start_addr, size, name } =>
-                    handle_file_hop(&node, &mut reader, &mut writer, token, start_addr, size, name).await?,
-                Command::FilePipeHop { token, start_addr, file_size, parts, index, name } =>
-                    handle_file_pipe_hop(&node, &mut reader, &mut writer, token, start_addr, file_size, parts, index, name).await?,
+                // NETMAP
+                Command::NetmapDiscover => handle_netmap_discover(&node, &mut writer).await?,
+                Command::NetmapHop {
+                    token,
+                    start_addr,
+                    entries,
+                } => handle_netmap_hop(&node, &mut writer, token, start_addr, entries).await?,
+                Command::NetmapDone { token, entries } => {
+                    handle_netmap_done(&node, &mut writer, token, entries).await?
+                }
+                Command::NetmapSet { entries } => {
+                    handle_netmap_set(&node, &mut writer, entries).await?
+                }
+                Command::NetmapGet => handle_netmap_get(&node, &mut writer).await?,
 
-                // LIST (CSV from in-memory tags)
-                Command::ListFiles =>
-                    handle_list_files_csv(&node, &mut writer).await?,
+                // FILE
+                Command::FilePush { size, name } => {
+                    handle_file_push(&node, &mut reader, &mut writer, size, name).await?
+                }
+                Command::FilePull { name } => handle_file_pull(&node, &mut writer, name).await?,
+                Command::FileList => handle_file_list_csv(&node, &mut writer).await?,
 
-                // FILE retrieval
-                Command::GetFile { name } =>
-                    handle_get_file(&node, &mut writer, name).await?,
-                Command::ChunkGet { name } =>
-                    handle_chunk_get(&node, &mut writer, name).await?,
+                // FILE (internal)
+                Command::FileRelayBlob {
+                    token,
+                    start_addr,
+                    size,
+                    name,
+                } => {
+                    handle_file_relay_blob(
+                        &node,
+                        &mut reader,
+                        &mut writer,
+                        token,
+                        start_addr,
+                        size,
+                        name,
+                    )
+                    .await?
+                }
+                Command::FileRelayStream {
+                    token,
+                    start_addr,
+                    file_size,
+                    parts,
+                    index,
+                    name,
+                } => {
+                    handle_file_relay_stream(
+                        &node,
+                        &mut reader,
+                        &mut writer,
+                        token,
+                        start_addr,
+                        file_size,
+                        parts,
+                        index,
+                        name,
+                    )
+                    .await?
+                }
+                Command::FileGetChunk { name } => {
+                    handle_file_get_chunk(&node, &mut writer, name).await?
+                }
             },
             Err(e) => handle_error(&mut writer, e).await?,
         }
@@ -104,36 +157,44 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
 
 /* --- Command handlers --- */
 
-async fn handle_set_next<W: AsyncWrite + Unpin>(
+async fn handle_node_next<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     addr: String,
 ) -> Result<(), AnyErr> {
     node.set_next(addr.clone()).await;
-    writer.write_all(format!("OK next={}\n", addr).as_bytes()).await?;
+    writer
+        .write_all(format!("OK next={}\n", addr).as_bytes())
+        .await?;
     Ok(())
 }
 
-async fn handle_get<W: AsyncWrite + Unpin>(node: &Node, writer: &mut W) -> Result<(), AnyErr> {
-    let next = node.get_next().await.unwrap_or_else(|| "<unset>".to_string());
+async fn handle_node_status<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+) -> Result<(), AnyErr> {
+    let next = node
+        .get_next()
+        .await
+        .unwrap_or_else(|| "<unset>".to_string());
     writer
         .write_all(format!("PORT {}\nNEXT {}\nOK\n", node.port, next).as_bytes())
         .await?;
     Ok(())
 }
 
-async fn handle_ring<W: AsyncWrite + Unpin>(
+async fn handle_ring_forward<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     mut ttl: u32,
     msg: String,
 ) -> Result<(), AnyErr> {
-    println!("[{}] RING(ttl={}) msg: {}", node.port, ttl, msg);
+    println!("[{}] RING FORWARD(ttl={}) msg: {}", node.port, ttl, msg);
 
     if ttl > 0 {
         ttl -= 1;
         if let Some(next_addr) = node.get_next().await {
-            if let Err(e) = node.forward_ring(ttl, &msg).await {
+            if let Err(e) = node.forward_ring_forward(ttl, &msg).await {
                 eprintln!("[{}] forward error to {}: {}", node.port, next_addr, e);
             }
         } else {
@@ -145,8 +206,8 @@ async fn handle_ring<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Handle "WALK" from the client on the start node.
-async fn handle_walk_start<W: AsyncWrite + Unpin>(
+/// Handle "TOPOLOGY WALK" from the client on the start node.
+async fn handle_topology_walk<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
@@ -158,8 +219,13 @@ async fn handle_walk_start<W: AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    if let Err(e) = node.forward_walk_hop(&token, &node.port, &history).await {
-        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
+    if let Err(e) = node
+        .forward_topology_hop(&token, &node.port, &history)
+        .await
+    {
+        writer
+            .write_all(format!("ERR forward failed: {e}\n").as_bytes())
+            .await?;
         return Ok(());
     }
 
@@ -170,14 +236,18 @@ async fn handle_walk_start<W: AsyncWrite + Unpin>(
             }
             writer.write_all(b"OK\n").await?;
         }
-        Ok(Err(_)) => { writer.write_all(b"ERR walk canceled\n").await?; }
-        Err(_) => { writer.write_all(b"ERR walk timeout\n").await?; }
+        Ok(Err(_)) => {
+            writer.write_all(b"ERR walk canceled\n").await?;
+        }
+        Err(_) => {
+            writer.write_all(b"ERR walk timeout\n").await?;
+        }
     }
 
     Ok(())
 }
 
-async fn handle_walk_hop<W: AsyncWrite + Unpin>(
+async fn handle_topology_hop<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     token: String,
@@ -192,12 +262,24 @@ async fn handle_walk_hop<W: AsyncWrite + Unpin>(
     let new_history = append_edge(history, &node.port, &next_addr);
 
     if port_str(&next_addr) == port_str(&start_addr) {
-        if let Err(e) = node.send_walk_done(&start_addr, &token, &new_history).await {
-            eprintln!("[{}] WALK DONE send failed to {}: {}", node.port, start_addr, e);
+        if let Err(e) = node
+            .send_topology_done(&start_addr, &token, &new_history)
+            .await
+        {
+            eprintln!(
+                "[{}] TOPOLOGY DONE send failed to {}: {}",
+                node.port, start_addr, e
+            );
         }
     } else {
-        if let Err(e) = node.forward_walk_hop(&token, &start_addr, &new_history).await {
-            eprintln!("[{}] WALK forward failed to {}: {}", node.port, next_addr, e);
+        if let Err(e) = node
+            .forward_topology_hop(&token, &start_addr, &new_history)
+            .await
+        {
+            eprintln!(
+                "[{}] TOPOLOGY HOP forward failed to {}: {}",
+                node.port, next_addr, e
+            );
         }
     }
 
@@ -205,7 +287,7 @@ async fn handle_walk_hop<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn handle_walk_done<W: AsyncWrite + Unpin>(
+async fn handle_topology_done<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     token: String,
@@ -216,9 +298,9 @@ async fn handle_walk_done<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* -------- INVESTIGATION / NETMAP -------- */
+/* -------- NETMAP -------- */
 
-async fn handle_investigate_start<W: AsyncWrite + Unpin>(
+async fn handle_netmap_discover<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
@@ -229,10 +311,12 @@ async fn handle_investigate_start<W: AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    // entries begins with "my_port=Alive"
+    // entries begins with "<node_port>=Alive"
     let entries = format!("{}=Alive", port_str(&node.port));
-    if let Err(e) = node.forward_invest_hop(&token, &node.port, &entries).await {
-        writer.write_all(format!("ERR forward failed: {e}\n").as_bytes()).await?;
+    if let Err(e) = node.forward_netmap_hop(&token, &node.port, &entries).await {
+        writer
+            .write_all(format!("ERR forward failed: {e}\n").as_bytes())
+            .await?;
         return Ok(());
     }
 
@@ -241,7 +325,7 @@ async fn handle_investigate_start<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn handle_investigate_hop<W: AsyncWrite + Unpin>(
+async fn handle_netmap_hop<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     token: String,
@@ -256,12 +340,24 @@ async fn handle_investigate_hop<W: AsyncWrite + Unpin>(
     let new_entries = node.entries_with_self(&entries);
 
     if port_str(&next_addr) == port_str(&start_addr) {
-        if let Err(e) = node.send_invest_done(&start_addr, &token, &new_entries).await {
-            eprintln!("[{}] INVEST DONE send failed to {}: {}", node.port, start_addr, e);
+        if let Err(e) = node
+            .send_netmap_done(&start_addr, &token, &new_entries)
+            .await
+        {
+            eprintln!(
+                "[{}] NETMAP DONE send failed to {}: {}",
+                node.port, start_addr, e
+            );
         }
     } else {
-        if let Err(e) = node.forward_invest_hop(&token, &start_addr, &new_entries).await {
-            eprintln!("[{}] INVEST forward failed to {}: {}", node.port, next_addr, e);
+        if let Err(e) = node
+            .forward_netmap_hop(&token, &start_addr, &new_entries)
+            .await
+        {
+            eprintln!(
+                "[{}] NETMAP HOP forward failed to {}: {}",
+                node.port, next_addr, e
+            );
         }
     }
 
@@ -269,7 +365,7 @@ async fn handle_investigate_hop<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn handle_investigate_done<W: AsyncWrite + Unpin>(
+async fn handle_netmap_done<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     _token: String,
@@ -319,7 +415,9 @@ fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
 }
 
 fn sum_len_up_to_inclusive(index: u32, total_size: u64, parts: u32) -> u64 {
-    (0..=index).map(|i| fair_chunk_len(i, total_size, parts)).sum()
+    (0..=index)
+        .map(|i| fair_chunk_len(i, total_size, parts))
+        .sum()
 }
 
 fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
@@ -329,7 +427,7 @@ fn chunk_file_name(name: &str, index: u32, parts: u32) -> String {
 
 /* -------- FILE: PUSH / HOP handlers -------- */
 
-async fn handle_push_file<R, W>(
+async fn handle_file_push<R, W>(
     node: &Node,
     reader: &mut R,
     writer: &mut W,
@@ -340,7 +438,12 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let name = Path::new(&name).file_name().unwrap().to_str().unwrap().to_string();
+    let name = Path::new(&name)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // Determine how many parts to split into: number of known nodes (fallback to 1)
     let parts: u32 = node.network_size().await as u32;
@@ -354,7 +457,9 @@ where
         let mut buf = vec![0u8; size as usize];
         reader.read_exact(&mut buf).await?;
         let _ = save_into_node_dir(node, &name, &buf).await?;
-        writer.write_all(format!("FILE {} bytes '{}' stored locally\nOK\n", size, name).as_bytes()).await?;
+        writer
+            .write_all(format!("FILE {} bytes '{}' stored locally\nOK", size, name).as_bytes())
+            .await?;
         return Ok(());
     }
 
@@ -372,24 +477,39 @@ where
     let mut first = vec![0u8; first_len as usize];
     reader.read_exact(&mut first).await?;
     let saved_as = save_into_node_dir(node, &chunk_file_name(&name, 0, parts), &first).await?;
-    println!("[{}] saved chunk 1/{parts}: {} ({} bytes)", node.port, saved_as.display(), first_len);
+    println!(
+        "[{}] saved chunk 1/{parts}: {} ({} bytes)",
+        node.port,
+        saved_as.display(),
+        first_len
+    );
 
     // Open connection to next and stream the remaining bytes
     let mut s = TcpStream::connect(&next).await?;
     let token = node.make_file_token();
-    let header = format!("FILE PIPE HOP {} {} {} {} {} {}\n",
-                         token, &node.port, size, parts, 1, name);
+    let header = format!(
+        "FILE RELAY-STREAM {} {} {} {} {} {}\n",
+        token, &node.port, size, parts, 1, name
+    );
     s.write_all(header.as_bytes()).await?;
 
     // Forward exactly the remaining bytes (size - first_len) from client -> next
     let mut limited = reader.take(size - first_len);
     copy(&mut limited, &mut s).await?;
 
-    writer.write_all(format!("FILE {} bytes split into {} chunks and distributed\nOK\n", size, parts).as_bytes()).await?;
+    writer
+        .write_all(
+            format!(
+                "FILE {} bytes split into {} chunks and distributed\nOK\n",
+                size, parts
+            )
+            .as_bytes(),
+        )
+        .await?;
     Ok(())
 }
 
-async fn handle_file_hop<R, W>(
+async fn handle_file_relay_blob<R, W>(
     node: &Node,
     reader: &mut R,
     writer: &mut W,
@@ -413,15 +533,18 @@ where
         return Ok(());
     }
 
-    // Save locally (best-effort)
+    // Save locally
     if let Err(e) = save_into_node_dir(node, &name, &buf).await {
         eprintln!("[{}] failed to save file '{}': {}", node.port, name, e);
     }
 
     // Forward to next
     if let Some(_) = node.get_next().await {
-        if let Err(e) = node.forward_file_hop(&token, &start_addr, size, &name, &buf).await {
-            eprintln!("[{}] FILE forward failed: {}", node.port, e);
+        if let Err(e) = node
+            .forward_file_relay_blob(&token, &start_addr, size, &name, &buf)
+            .await
+        {
+            eprintln!("[{}] FILE RELAY-BLOB forward failed: {}", node.port, e);
         }
     }
 
@@ -429,7 +552,7 @@ where
     Ok(())
 }
 
-async fn handle_file_pipe_hop<R, W>(
+async fn handle_file_relay_stream<R, W>(
     node: &Node,
     reader: &mut R,
     writer: &mut W,
@@ -445,7 +568,9 @@ where
     W: AsyncWrite + Unpin,
 {
     if index >= parts {
-        writer.write_all(b"ERR bad FILE PIPE index\n").await?;
+        writer
+            .write_all(b"ERR bad FILE RELAY-STREAM index\n")
+            .await?;
         return Ok(());
     }
 
@@ -460,7 +585,14 @@ where
 
     // Save my chunk locally
     let saved_as = save_into_node_dir(node, &chunk_file_name(&name, index, parts), &buf).await?;
-    println!("[{}] saved chunk {}/{}: {} ({} bytes)", node.port, index + 1, parts, saved_as.display(), my_len);
+    println!(
+        "[{}] saved chunk {}/{}: {} ({} bytes)",
+        node.port,
+        index + 1,
+        parts,
+        saved_as.display(),
+        my_len
+    );
 
     // If not the last chunk, forward remaining bytes to next with index+1
     let consumed = sum_len_up_to_inclusive(index, file_size, parts);
@@ -468,8 +600,15 @@ where
     if remaining > 0 {
         if let Some(next) = node.get_next().await {
             let mut s = TcpStream::connect(&next).await?;
-            let header = format!("FILE PIPE HOP {} {} {} {} {} {}\n",
-                                 token, start_addr, file_size, parts, index + 1, name);
+            let header = format!(
+                "FILE RELAY-STREAM {} {} {} {} {} {}\n",
+                token,
+                start_addr,
+                file_size,
+                parts,
+                index + 1,
+                name
+            );
             s.write_all(header.as_bytes()).await?;
             let mut limited = reader.take(remaining);
             copy(&mut limited, &mut s).await?;
@@ -483,9 +622,9 @@ where
     Ok(())
 }
 
-/* -------- FILE RETRIEVAL (GET_FILE / CHUNK GET) -------- */
+/* -------- FILE RETRIEVAL (PULL / GET-CHUNK) -------- */
 
-async fn handle_get_file<W: AsyncWrite + Unpin>(
+async fn handle_file_pull<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     name: String,
@@ -507,23 +646,25 @@ async fn handle_get_file<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn handle_chunk_get<W: AsyncWrite + Unpin>(
+async fn handle_file_get_chunk<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
     name: String,
 ) -> Result<(), AnyErr> {
     let next = node.get_next().await.unwrap_or_else(|| node.port.clone());
-    let chunk = read_local_chunk_bytes(node, &name).await.unwrap_or_default();
+    let chunk = read_local_chunk_bytes(node, &name)
+        .await
+        .unwrap_or_default();
 
     // Header + exact bytes for node-to-node transfer
     writer
-        .write_all(format!("CHUNK RESP {} {} {}\n", next, chunk.len(), name).as_bytes())
+        .write_all(format!("FILE RESP-CHUNK {} {} {}\n", next, chunk.len(), name).as_bytes())
         .await?;
     writer.write_all(&chunk).await?;
     Ok(())
 }
 
-/* --- GET_FILE helpers --- */
+/* --- PULL helpers --- */
 
 async fn pull_file_from_ring(node: &Node, name: &str, start_addr: &str) -> Result<Vec<u8>, AnyErr> {
     let start_port = port_str(start_addr).to_string();
@@ -557,25 +698,29 @@ async fn pull_file_from_ring(node: &Node, name: &str, start_addr: &str) -> Resul
 
 async fn request_chunk_from(addr: &str, name: &str) -> Result<(Vec<u8>, String), AnyErr> {
     let mut s = TcpStream::connect(addr).await?;
-    s.write_all(format!("CHUNK GET {}\n", name).as_bytes()).await?;
+    s.write_all(format!("FILE GET-CHUNK {}\n", name).as_bytes())
+        .await?;
 
     let (r, mut w) = s.into_split();
     let mut reader = BufReader::new(r);
 
-    // Parse: CHUNK RESP <next_addr> <size> <name>\n
+    // Parse: FILE RESP-CHUNK <next_addr> <size> <name>
+
     let mut header = String::new();
     reader.read_line(&mut header).await?;
     let header = header.trim_end_matches(['\r', '\n']);
 
     let rest = header
-        .strip_prefix("CHUNK RESP ")
-        .ok_or_else(|| "malformed CHUNK RESP".to_string())?;
+        .strip_prefix("FILE RESP-CHUNK ")
+        .ok_or_else(|| "malformed FILE RESP-CHUNK".to_string())?;
     let mut parts = rest.splitn(3, ' ');
     let next_addr = parts.next().unwrap_or("").to_string();
     let size_str = parts.next().unwrap_or("");
     let _name_echo = parts.next().unwrap_or("").to_string();
 
-    let size: usize = size_str.parse().map_err(|_| "invalid chunk size".to_string())?;
+    let size: usize = size_str
+        .parse()
+        .map_err(|_| "invalid chunk size".to_string())?;
     let mut buf = vec![0u8; size];
     reader.read_exact(&mut buf).await?;
 
@@ -593,7 +738,9 @@ async fn read_local_chunk_bytes(node: &Node, name: &str) -> Result<Vec<u8>, AnyE
     let mut rd = fs::read_dir(&dir).await?;
     while let Some(ent) = rd.next_entry().await? {
         let ft = ent.file_type().await?;
-        if !ft.is_file() { continue; }
+        if !ft.is_file() {
+            continue;
+        }
         let fname = ent.file_name();
         let fname = fname.to_string_lossy();
         if fname.starts_with(&safe_prefix) && fname.contains(".part-") && fname.contains("-of-") {
@@ -604,13 +751,13 @@ async fn read_local_chunk_bytes(node: &Node, name: &str) -> Result<Vec<u8>, AnyE
     Ok(Vec::new())
 }
 
-/* -------- LIST_FILES: local-only listing -------- */
+/* -------- FILE LIST -------- */
 
-async fn handle_list_files_csv<W: AsyncWrite + Unpin>(
+async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
     node: &Node,
     writer: &mut W,
 ) -> Result<(), AnyErr> {
-    // Pure CSV output (header + rows). No trailing "OK".
+    // Pure CSV output (header + rows)
     writer.write_all(b"name,start,size\n").await?;
 
     let tags = node.file_tags.read().await;
@@ -627,18 +774,31 @@ async fn handle_list_files_csv<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/* --- Helpers & Errors --- */
+/* --- Helpers and Errors --- */
 
 async fn handle_error<W: AsyncWrite + Unpin>(writer: &mut W, err: String) -> Result<(), AnyErr> {
-    writer.write_all(format!("ERR {}\n", err).as_bytes()).await?;
+    writer
+        .write_all(format!("ERR {}\n", err).as_bytes())
+        .await?;
     Ok(())
 }
 
 fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
-        let bad = ch == '/' || ch == '\\' || ch == '\0' || ch == ':' || ch == '|' || ch == ';' || ch == '\n' || ch == '\r';
-        if bad { out.push('_'); } else { out.push(ch); }
+        let bad = ch == '/'
+            || ch == '\\'
+            || ch == '\0'
+            || ch == ':'
+            || ch == '|'
+            || ch == ';'
+            || ch == '\n'
+            || ch == '\r';
+        if bad {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
     }
     if out.is_empty() { "_".into() } else { out }
 }
