@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 }
 
-/* ----------------------------- run ------------------------------ */
+/* ------------------------- run -------------------------- */
 
 fn resolve_listen_addr(addr: Option<String>, port: Option<u16>) -> String {
     // Priority: explicit --addr, then --port, then PORT env, else default.
@@ -117,7 +117,7 @@ async fn set_network(
         return Ok(());
     }
 
-    // Prepare a fresh "nodes/" directory each time.
+    // Prepare a fresh "nodes/" directory
     let nodes_root = Path::new("nodes");
     if nodes_root.exists() {
         fs::remove_dir_all(nodes_root)?;
@@ -164,7 +164,7 @@ async fn set_network(
         println!("node {host}:{port} is listening");
     }
 
-    // 4) Wire the ring via SET_NEXT
+    // 4) Wire the ring via NODE NEXT
     for i in 0..nodes {
         let this_port = base_port + i;
         let next_port = if i + 1 == nodes {
@@ -174,7 +174,7 @@ async fn set_network(
         };
         let this_addr = format!("{host}:{this_port}");
         let next_addr = format!("{host}:{next_port}");
-        send_set_next(&this_addr, &next_addr).await?;
+        send_node_next(&this_addr, &next_addr).await?;
         println!("wired {this_addr} -> {next_addr}");
     }
 
@@ -182,7 +182,7 @@ async fn set_network(
 
     // 4.5) Kick off a full investigation from the first node
     let start_addr = format!("{host}:{base_port}");
-    if let Err(e) = send_investigate(&start_addr).await {
+    if let Err(e) = send_netmap_discover(&start_addr).await {
         eprintln!("failed to start investigation from {start_addr}: {e}");
     } else {
         println!("started full investigation from {start_addr}");
@@ -227,12 +227,12 @@ async fn wait_until_listening(
     }
 }
 
-async fn send_set_next(
+async fn send_node_next(
     this_addr: &str,
     next_addr: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut s = TcpStream::connect(this_addr).await?;
-    let line = format!("SET_NEXT {next_addr}\n");
+    let line = format!("NODE NEXT {next_addr}\n");
     s.write_all(line.as_bytes()).await?;
 
     // Best-effort ACK: accept "OK" or "OK <anything>"
@@ -246,14 +246,14 @@ async fn send_set_next(
     let ack = buf.trim();
     let upper = ack.to_ascii_uppercase();
     if !(upper == "OK" || upper.starts_with("OK ")) {
-        return Err(format!("unexpected response to SET_NEXT from {this_addr}: {buf}").into());
+        return Err(format!("unexpected response to NODE NEXT from {this_addr}: {buf}").into());
     }
     Ok(())
 }
 
-async fn send_investigate(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn send_netmap_discover(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut s = TcpStream::connect(start_addr).await?;
-    s.write_all(b"INVESTIGATE\n").await?;
+    s.write_all(b"NETMAP DISCOVER\n").await?;
     // we don't need to wait; but try a tiny ACK read (best-effort)
     let mut reader = BufReader::new(s);
     let mut buf = String::new();
