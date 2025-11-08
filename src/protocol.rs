@@ -5,6 +5,7 @@
 //! NODE
 //!   - "NODE NEXT <addr>" (client -> any node)
 //!   - "NODE STATUS"      (client -> any node)
+//!   - "NODE PING"        (node -> node)
 //!
 //! RING
 //!   - "RING FORWARD <ttl> <message...>"
@@ -13,6 +14,7 @@
 //!   - "TOPOLOGY WALK"                       (client -> start node)
 //!   - "TOPOLOGY HOP <token> <start> <hist>" (node -> node; single line)
 //!   - "TOPOLOGY DONE <token> <hist>"        (last node -> start node)
+//!   - "TOPOLOGY SET <hist>"                 (node -> all nodes)
 //!
 //! NETMAP
 //!   - "NETMAP DISCOVER"                           (client -> start node)
@@ -25,6 +27,7 @@
 //!   - "FILE PUSH <size> <name>" (client -> start)
 //!   - "FILE PULL <name>"        (client -> any node)
 //!   - "FILE LIST"               (client -> any)
+//!   - "FILE TAGS-SET <entries>" (node -> node)
 //!
 //! FILE (internal)
 //!   - "FILE RELAY-BLOB <token> <start_addr> <size> <name>"
@@ -41,6 +44,7 @@ pub enum Command {
     // NODE
     NodeNext(String), // NODE NEXT <addr>
     NodeStatus,       // NODE STATUS
+    NodePing,         // NODE PING
 
     // RING
     RingForward {
@@ -57,6 +61,9 @@ pub enum Command {
     },
     TopologyDone {
         token: String,
+        history: String,
+    },
+    TopologySet {
         history: String,
     },
 
@@ -85,6 +92,9 @@ pub enum Command {
         name: String,
     }, // "FILE PULL <name>"
     FileList, // "FILE LIST"
+    FileTagsSet {
+        entries: String,
+    },
 
     // FILE (internal)
     FileRelayBlob {
@@ -136,6 +146,9 @@ fn parse_node_cmd(rest: &str) -> Result<Command, String> {
     if rest.eq_ignore_ascii_case("STATUS") {
         return Ok(Command::NodeStatus);
     }
+    if rest.eq_ignore_ascii_case("PING") {
+        return Ok(Command::NodePing);
+    }
     Err("unknown NODE command".into())
 }
 
@@ -180,6 +193,11 @@ fn parse_topology_cmd(rest: &str) -> Result<Command, String> {
         return Ok(Command::TopologyDone {
             token: token.to_string(),
             history,
+        });
+    }
+    if let Some(rest) = rest.strip_prefix("SET ") {
+        return Ok(Command::TopologySet {
+            history: rest.to_string(),
         });
     }
     Err("unknown TOPOLOGY command".into())
@@ -253,6 +271,13 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
     // LIST
     if rest.eq_ignore_ascii_case("LIST") {
         return Ok(Command::FileList);
+    }
+
+    // TAGS-SET
+    if let Some(rest) = rest.strip_prefix("TAGS-SET ") {
+        return Ok(Command::FileTagsSet {
+            entries: rest.to_string(),
+        });
     }
 
     // GET-CHUNK
