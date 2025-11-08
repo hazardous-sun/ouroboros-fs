@@ -1,28 +1,32 @@
 use std::path::Path;
-use std::time::Duration;
-use std::{error, path::PathBuf, sync::Arc};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use std::{env, error, path::PathBuf, sync::Arc};
+use std::error::Error;
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
+use tokio::time::sleep;
 
 use crate::{
-    node::{Node, append_edge, port_str},
-    protocol::{self, Command},
+    node::{self, Node, append_edge, port_str},
+    protocol,
 };
 
 type AnyErr = Box<dyn error::Error + Send + Sync>;
 
 /// Run the TCP server and handle connections.
-pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
+pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyErr> {
     // Initialize TCP listener and collect its address
     let listener = TcpListener::bind(bind_addr).await?;
     let local = listener.local_addr()?;
 
     // Initialize Node structure
-    let node = Node::new(local.to_string());
-    println!("node listening on {}", node.port);
+    let node = Node::new(local.to_string(), gossip_interval);
+    println!("[{}] node listening on {}", node.port, node.port);
 
     // Create nodes/<port> directory once the node is up
     let port_only = port_str(&node.port);
@@ -33,13 +37,26 @@ pub async fn run(bind_addr: &str) -> Result<(), AnyErr> {
         println!("[{}] created {}", node.port, node_dir);
     }
 
+    // Spawn the gossip loop
+    if gossip_interval > Duration::from_millis(0) {
+        let gossip_node = Arc::clone(&node);
+        tokio::spawn(async move {
+            println!("[{}] Gossip loop starting (interval: {:?})", gossip_node.port, gossip_interval);
+            spawn_gossip_loop(gossip_node).await;
+        });
+    }
+
     // Accept connections
     loop {
         let (stream, peer) = listener.accept().await?;
         let node = Arc::clone(&node);
+
+        // Clone the port for logging before moving `node`
+        let node_port = node.port.clone();
+
         tokio::spawn(async move {
             if let Err(e) = handle_client(node, stream).await {
-                eprintln!("client {peer}: error: {e}");
+                eprintln!("[{node_port}] client {peer}: error: {e}");
             }
         });
     }
@@ -64,49 +81,57 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
         match protocol::parse_line(&line) {
             Ok(cmd) => match cmd {
                 // NODE
-                Command::NodeNext(addr) => handle_node_next(&node, &mut writer, addr).await?,
-                Command::NodeStatus => handle_node_status(&node, &mut writer).await?,
+                protocol::Command::NodeNext(addr) => handle_node_next(&node, &mut writer, addr).await?,
+                protocol::Command::NodeStatus => handle_node_status(&node, &mut writer).await?,
+                protocol::Command::NodePing => handle_node_ping(&mut writer).await?,
 
                 // RING
-                Command::RingForward { ttl, msg } => {
+                protocol::Command::RingForward { ttl, msg } => {
                     handle_ring_forward(&node, &mut writer, ttl, msg).await?
                 }
 
                 // TOPOLOGY
-                Command::TopologyWalk => handle_topology_walk(&node, &mut writer).await?,
-                Command::TopologyHop {
+                protocol::Command::TopologyWalk => handle_topology_walk(&node, &mut writer).await?,
+                protocol::Command::TopologyHop {
                     token,
                     start_addr,
                     history,
                 } => handle_topology_hop(&node, &mut writer, token, start_addr, history).await?,
-                Command::TopologyDone { token, history } => {
-                    handle_topology_done(&node, &mut writer, token, history).await?
+                protocol::Command::TopologyDone { token, history } => {
+                    // Pass an owned Arc so it can be moved into the new task
+                    handle_topology_done(Arc::clone(&node), &mut writer, token, history).await?
+                }
+                protocol::Command::TopologySet { history } => {
+                    handle_topology_set(&node, &mut writer, history).await?
                 }
 
                 // NETMAP
-                Command::NetmapDiscover => handle_netmap_discover(&node, &mut writer).await?,
-                Command::NetmapHop {
+                protocol::Command::NetmapDiscover => handle_netmap_discover(&node, &mut writer).await?,
+                protocol::Command::NetmapHop {
                     token,
                     start_addr,
                     entries,
                 } => handle_netmap_hop(&node, &mut writer, token, start_addr, entries).await?,
-                Command::NetmapDone { token, entries } => {
+                protocol::Command::NetmapDone { token, entries } => {
                     handle_netmap_done(&node, &mut writer, token, entries).await?
                 }
-                Command::NetmapSet { entries } => {
+                protocol::Command::NetmapSet { entries } => {
                     handle_netmap_set(&node, &mut writer, entries).await?
                 }
-                Command::NetmapGet => handle_netmap_get(&node, &mut writer).await?,
+                protocol::Command::NetmapGet => handle_netmap_get(&node, &mut writer).await?,
 
                 // FILE
-                Command::FilePush { size, name } => {
+                protocol::Command::FilePush { size, name } => {
                     handle_file_push(&node, &mut reader, &mut writer, size, name).await?
                 }
-                Command::FilePull { name } => handle_file_pull(&node, &mut writer, name).await?,
-                Command::FileList => handle_file_list_csv(&node, &mut writer).await?,
+                protocol::Command::FilePull { name } => handle_file_pull(&node, &mut writer, name).await?,
+                protocol::Command::FileList => handle_file_list_csv(&node, &mut writer).await?,
+                protocol::Command::FileTagsSet { entries } => {
+                    handle_file_tags_set(&node, &mut writer, entries).await?
+                }
 
                 // FILE (internal)
-                Command::FileRelayBlob {
+                protocol::Command::FileRelayBlob {
                     token,
                     start_addr,
                     size,
@@ -121,9 +146,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                         size,
                         name,
                     )
-                    .await?
+                        .await?
                 }
-                Command::FileRelayStream {
+                protocol::Command::FileRelayStream {
                     token,
                     start_addr,
                     file_size,
@@ -142,9 +167,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                         index,
                         name,
                     )
-                    .await?
+                        .await?
                 }
-                Command::FileGetChunk { name } => {
+                protocol::Command::FileGetChunk { name } => {
                     handle_file_get_chunk(&node, &mut writer, name).await?
                 }
             },
@@ -180,6 +205,11 @@ async fn handle_node_status<W: AsyncWrite + Unpin>(
     writer
         .write_all(format!("PORT {}\nNEXT {}\nOK\n", node.port, next).as_bytes())
         .await?;
+    Ok(())
+}
+
+async fn handle_node_ping<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<(), AnyErr> {
+    writer.write_all(b"PONG\n").await?;
     Ok(())
 }
 
@@ -288,13 +318,33 @@ async fn handle_topology_hop<W: AsyncWrite + Unpin>(
 }
 
 async fn handle_topology_done<W: AsyncWrite + Unpin>(
-    node: &Node,
+    node: Arc<Node>,
     writer: &mut W,
     token: String,
     history: String,
 ) -> Result<(), AnyErr> {
-    let _ = node.finish_walk(&token, history).await;
+    // Finish the client walk if we are the start node
+    let _ = node.finish_walk(&token, history.clone()).await;
+
+    // Persist and broadcast the completed topology
+    node.set_topology_from_history(&history).await;
+
+    let node_clone = Arc::clone(&node);
+    tokio::spawn(async move {
+        node_clone.broadcast_topology_set().await;
+    });
+
     let _ = writer.write_all(b"OK\n").await;
+    Ok(())
+}
+
+async fn handle_topology_set<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    history: String,
+) -> Result<(), AnyErr> {
+    node.set_topology_from_history(&history).await;
+    writer.write_all(b"OK\n").await?;
     Ok(())
 }
 
@@ -411,7 +461,11 @@ fn fair_chunk_len(index: u32, total_size: u64, parts: u32) -> u64 {
     // Distribute remainder to the first (total_size % parts) chunks
     let base = total_size / parts as u64;
     let rem = total_size % parts as u64;
-    if (index as u64) < rem { base + 1 } else { base }
+    if (index as u64) < rem {
+        base + 1
+    } else {
+        base
+    }
 }
 
 fn sum_len_up_to_inclusive(index: u32, total_size: u64, parts: u32) -> u64 {
@@ -503,7 +557,7 @@ where
                 "FILE {} bytes split into {} chunks and distributed\nOK\n",
                 size, parts
             )
-            .as_bytes(),
+                .as_bytes(),
         )
         .await?;
     Ok(())
@@ -618,6 +672,16 @@ where
         let _ = node.finish_file(&token).await;
     }
 
+    writer.write_all(b"OK\n").await?;
+    Ok(())
+}
+
+async fn handle_file_tags_set<W: AsyncWrite + Unpin>(
+    node: &Node,
+    writer: &mut W,
+    entries: String,
+) -> Result<(), AnyErr> {
+    node.set_file_tags_from_entries(&entries).await;
     writer.write_all(b"OK\n").await?;
     Ok(())
 }
@@ -761,7 +825,7 @@ async fn handle_file_list_csv<W: AsyncWrite + Unpin>(
     writer.write_all(b"name,start,size\n").await?;
 
     let tags = node.file_tags.read().await;
-    let mut items: Vec<(&String, &crate::node::FileTag)> = tags.iter().collect();
+    let mut items: Vec<(&String, &node::FileTag)> = tags.iter().collect();
     items.sort_by(|a, b| a.0.cmp(b.0));
 
     for (name, tag) in items {
@@ -800,7 +864,11 @@ fn sanitize_filename(name: &str) -> String {
             out.push(ch);
         }
     }
-    if out.is_empty() { "_".into() } else { out }
+    if out.is_empty() {
+        "_".into()
+    } else {
+        out
+    }
 }
 
 async fn save_into_node_dir(node: &Node, name: &str, data: &[u8]) -> Result<PathBuf, AnyErr> {
@@ -830,4 +898,190 @@ fn csv_escape(s: &str) -> String {
 
 fn host_of(addr: &str) -> &str {
     addr.split(':').next().unwrap_or("127.0.0.1")
+}
+
+/* --- Gossip and Healing Functions --- */
+
+/// The main gossip loop task
+async fn spawn_gossip_loop(node: Arc<Node>) {
+    loop {
+        // Wait for the gossip interval
+        tokio::time::sleep(node.gossip_interval).await;
+
+        // Find out who to ping
+        let Some(next_addr) = node.get_next().await else {
+            println!("[{}] Gossip: No next node set, skipping health check.", node.port);
+            continue;
+        };
+
+        println!("[{}] Gossip: Sending PING to {}", node.port, next_addr);
+        match check_node_health(node.clone(), &next_addr).await {
+            Ok(_) => {
+                println!("[{}] Gossip: Received PONG from {}", node.port, next_addr);
+            }
+            Err(e) => {
+                // Health check failed, start the healing process
+                eprintln!(
+                    "[{}] Gossip: Health check failed for {}: {}",
+                    node.port, next_addr, e
+                );
+
+                // Start healing in a new task to not block the gossip loop
+                let heal_node = node.clone();
+                tokio::spawn(async move {
+                    let node_port = heal_node.port.clone();
+                    if let Err(e) = handle_node_death(heal_node, next_addr).await {
+                        eprintln!("[{node_port}] Gossip: Node healing process failed: {e}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Tries to send "NODE PING" and expects "PONG"
+async fn check_node_health(_node: Arc<Node>, addr: &str) -> Result<(), AnyErr> {
+    let timeout = Duration::from_secs(2);
+
+    // Connect with timeout
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr)).await??;
+    stream.write_all(b"NODE PING\n").await?;
+
+    // Read response with timeout
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    tokio::time::timeout(timeout, reader.read_line(&mut buf)).await??;
+
+    if buf.trim().eq_ignore_ascii_case("PONG") {
+        Ok(())
+    } else {
+        Err("invalid PONG response".into())
+    }
+}
+
+/// The healing process workflow
+async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), AnyErr> {
+    println!("[{}] Starting healing process for node {}", node.port, dead_addr);
+    let dead_port = port_str(&dead_addr).to_string();
+    let dead_host = host_of(&dead_addr);
+
+    // 1. Update local map to Dead
+    node.update_node_status(dead_port.clone(), crate::NodeStatus::Dead)
+        .await;
+
+    // 2. Broadcast change
+    println!("[{}] Broadcasting node {} as Dead", node.port, dead_port);
+    node.broadcast_netmap_update().await;
+
+    // 3. Start a new process
+    println!("[{}] Respawning node at {}", node.port, dead_addr);
+    let exe = current_exe()?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("run")
+        .arg("--addr")
+        .arg(&dead_addr)
+        .arg("--wait-time")
+        .arg(node.gossip_interval.as_millis().to_string());
+
+    #[cfg(unix)]
+    {
+        // use std::os::unix::process::CommandExt as _;
+        let _ = cmd.process_group(0);
+    }
+
+    // Spawn the child and detach it by just dropping the handle.
+    // The process will keep running.
+    let _ = cmd.spawn()?;
+
+    // Wait for it to be up
+    println!("[{}] Waiting for respawned node {} to listen...", node.port, dead_addr);
+    wait_until_listening(dead_host, dead_port.parse()?, Duration::from_secs(10)).await?;
+    println!("[{}] Respawned node {} is up.", node.port, dead_addr);
+
+    // 4. Update map to Alive
+    node.update_node_status(dead_port.clone(), crate::NodeStatus::Alive).await;
+
+    // 5. Share shared data
+    println!("[{}] Sharing network data with {}", node.port, dead_addr);
+    share_data_with_new_node(&node, &dead_addr).await?;
+
+    // 6. Broadcast change (Alive)
+    println!("[{}] Broadcasting node {} as Alive", node.port, dead_port);
+    node.broadcast_netmap_update().await;
+
+    println!("[{}] Healing process for {} complete.", node.port, dead_addr);
+    Ok(())
+}
+
+/// Sends all shared state to a newly spawned node
+async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<(), AnyErr> {
+    let timeout = Duration::from_millis(500);
+
+    // Share NETMAP
+    let entries = node.get_network_nodes_entries().await;
+    let mut s_netmap = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+    s_netmap
+        .write_all(format!("NETMAP SET {}\n", entries).as_bytes())
+        .await?;
+    s_netmap.shutdown().await?;
+
+    // Share TOPOLOGY
+    let history = node.get_topology_history().await;
+    if !history.is_empty() {
+        let mut s_topo =
+            tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        s_topo
+            .write_all(format!("TOPOLOGY SET {}\n", history).as_bytes())
+            .await?;
+        s_topo.shutdown().await?;
+    }
+
+    // Share FILE TAGS
+    let tags_entries = node.get_file_tags_entries().await;
+    if !tags_entries.is_empty() {
+        let mut s_tags =
+            tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        s_tags
+            .write_all(format!("FILE TAGS-SET {}\n", tags_entries).as_bytes())
+            .await?;
+        s_tags.shutdown().await?;
+    }
+
+    // Share its NEXT hop
+    let next_hop = node.get_next_for_node(port_str(new_node_addr)).await;
+    if let Some(next_addr) = next_hop {
+        let mut s_next =
+            tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
+        s_next
+            .write_all(format!("NODE NEXT {}\n", next_addr).as_bytes())
+            .await?;
+        s_next.shutdown().await?;
+    }
+
+    Ok(())
+}
+
+fn current_exe() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    Ok(env::current_exe()?)
+}
+
+async fn wait_until_listening(
+    host: &str,
+    port: u16,
+    deadline: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let start = Instant::now();
+    let addr = format!("{}:{}", host, port);
+    loop {
+        match TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                if start.elapsed() > deadline {
+                    return Err(format!("timed out while waiting for {}", addr).into());
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }

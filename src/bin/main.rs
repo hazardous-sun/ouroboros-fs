@@ -29,6 +29,9 @@ enum Cmd {
         /// Provide only the port, and host defaults to 127.0.0.1
         #[arg(short, long)]
         port: Option<u16>,
+        /// Time (ms) between health checks to the next node. 0 to disable.
+        #[arg(long, default_value_t = 5000u64)]
+        wait_time: u64,
     },
 
     /// Spawn N nodes and stitch them into a ring
@@ -48,6 +51,9 @@ enum Cmd {
         /// Extra wait after spawning children before wiring (ms)
         #[arg(long, default_value_t = 200u64)]
         wait_ms: u64,
+        /// Time (ms) between health checks for each node. 0 to disable.
+        #[arg(short = 'w', long = "wait-time", default_value_t = 5000u64)]
+        wait_time: u64,
     },
 }
 
@@ -55,9 +61,10 @@ enum Cmd {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Run { addr, port } => {
+        Cmd::Run { addr, port, wait_time } => {
             let bind = resolve_listen_addr(addr, port);
-            run(&bind).await
+            let gossip_interval = Duration::from_millis(wait_time);
+            run(&bind, gossip_interval).await
         }
         Cmd::SetNetwork {
             nodes,
@@ -65,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             host,
             no_block,
             wait_ms,
+            wait_time,
         } => {
             set_network(
                 nodes,
@@ -72,8 +80,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 &host,
                 !no_block,
                 Duration::from_millis(wait_ms),
+                wait_time,
             )
-            .await
+                .await
         }
     }
 }
@@ -115,6 +124,7 @@ async fn set_network(
     host: &str,
     block: bool,
     extra_wait: Duration,
+    wait_time: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
         eprintln!("--nodes must be >= 1");
@@ -141,7 +151,11 @@ async fn set_network(
         let port = base_port + i;
         let addr = format!("{host}:{port}");
         let mut cmd = Command::new(&exe);
-        cmd.arg("run").arg("--addr").arg(&addr);
+        cmd.arg("run")
+            .arg("--addr")
+            .arg(&addr)
+            .arg("--wait-time")
+            .arg(wait_time.to_string());
 
         #[cfg(unix)]
         {
@@ -190,14 +204,22 @@ async fn set_network(
         println!("started full investigation from {start_addr}");
     }
 
-    // 6. Optionally block until user quits / Ctrl-C
+    // 6. Start a topology walk to populate topology maps
+    if let Err(e) = send_topology_walk(&start_addr).await {
+        eprintln!("failed to start topology walk from {start_addr}: {e}");
+    } else {
+        println!("started topology walk from {start_addr}");
+    }
+
+
+    // 7. Optionally block until user quits / Ctrl-C
     if block {
         println!("type 'quit' or press Ctrl-C to stop…");
         wait_for_quit_or_ctrl_c().await;
         println!("stopping nodes…");
     }
 
-    // 7. Cleanup
+    // 8. Cleanup
     for mut child in children {
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -256,6 +278,15 @@ async fn send_node_next(
 async fn send_netmap_discover(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut s = TcpStream::connect(start_addr).await?;
     s.write_all(b"NETMAP DISCOVER\n").await?;
+    let mut reader = BufReader::new(s);
+    let mut buf = String::new();
+    let _ = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut buf)).await;
+    Ok(())
+}
+
+async fn send_topology_walk(start_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut s = TcpStream::connect(start_addr).await?;
+    s.write_all(b"TOPOLOGY WALK\n").await?;
     let mut reader = BufReader::new(s);
     let mut buf = String::new();
     let _ = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut buf)).await;
