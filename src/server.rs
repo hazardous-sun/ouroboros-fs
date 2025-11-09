@@ -175,7 +175,10 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<(), AnyErr>
                     handle_file_pull(&node, &mut writer, name).await?;
                     break;
                 }
-                protocol::Command::FileList => handle_file_list_csv(&node, &mut writer).await?,
+                protocol::Command::FileList => {
+                    handle_file_list_csv(&node, &mut writer).await?;
+                    break;
+                }
                 protocol::Command::FileTagsSet { entries } => {
                     handle_file_tags_set(&node, &mut writer, entries).await?
                 }
