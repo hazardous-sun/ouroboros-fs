@@ -1,48 +1,134 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-// 1. Import your new component
+import { ref, onMounted, onUnmounted } from 'vue'
 import NodesGraph from './components/NodesGraph.vue'
+import DirectoryTree from './components/DirectoryTree.vue'
 
-// 2. Create a reactive variable to hold the node count
-const nodeCount = ref(3) // Start with a triangle
+const nodeCount = ref(4) // Start with a square
+const containerRef = ref<HTMLElement | null>(null)
+const leftPanelWidth = ref('50%')
+const isResizing = ref(false)
+
+// Resize Handlers
+
+function startResize(event: MouseEvent) {
+  isResizing.value = true
+  window.addEventListener('mousemove', doResize)
+  window.addEventListener('mouseup', stopResize)
+  event.preventDefault()
+}
+
+function doResize(event: MouseEvent) {
+  if (!isResizing.value || !containerRef.value) {
+    return
+  }
+
+  // Calculate new width based on mouse position
+  const containerRect = containerRef.value.getBoundingClientRect()
+  const newWidth = event.clientX - containerRect.left
+
+  // Set boundaries
+  if (newWidth > 200 && newWidth < containerRect.width - 200) {
+    leftPanelWidth.value = `${newWidth}px`
+  }
+}
+
+function stopResize() {
+  isResizing.value = false
+  // IMPORTANT: Remove global listeners
+  window.removeEventListener('mousemove', doResize)
+  window.removeEventListener('mouseup', stopResize)
+}
 </script>
 
 <template>
   <header>
-    <h1>Nodes Graph</h1>
-    <p>
-      Based on
-      <a href="https://vuejs.org/" target="_blank" rel="noopener">vuejs.org</a>
-      template
-    </p>
+    <h1>OuroborosFS Dashboard</h1>
   </header>
 
-  <main>
-    <div class="controls">
-      <label for="nodes">Number of Nodes: {{ nodeCount }}</label>
-      <input
-          id="nodes"
-          v-model.number="nodeCount"
-          type="range"
-          min="1"
-          max="20"
-          step="1"
-      />
+  <div class="resizable-container" ref="containerRef">
+
+    <div class="panel panel-left" :style="{ flexBasis: leftPanelWidth }">
+      <div class="panel-content">
+        <div class="controls">
+          <label for="nodes">Number of Nodes: {{ nodeCount }}</label>
+          <input
+              id="nodes"
+              v-model.number="nodeCount"
+              type="range"
+              min="1"
+              max="20"
+              step="1"
+          />
+        </div>
+        <NodesGraph :node-count="nodeCount" />
+      </div>
     </div>
 
-    <NodesGraph :node-count="nodeCount" />
-  </main>
+    <div class="splitter" @mousedown="startResize"></div>
+
+    <div class="panel panel-right">
+      <DirectoryTree :refresh-interval="5000" />
+    </div>
+
+  </div>
 </template>
 
-<style scoped>
+<style>
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  font-family: sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
 header {
   text-align: center;
   padding: 1rem;
   border-bottom: 1px solid #ddd;
+  flex-shrink: 0;
 }
 
-main {
+.resizable-container {
+  display: flex;
+  flex-grow: 1;
+  width: 100%;
+  overflow: hidden;
+}
+
+.panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-left {
+  flex-shrink: 0;
+  flex-grow: 0;
+}
+
+.panel-right {
+  flex-grow: 1;
+  flex-shrink: 1;
+}
+
+.panel-content {
+  overflow-y: auto;
   padding: 1rem;
+}
+
+.splitter {
+  flex-basis: 6px;
+  flex-shrink: 0;
+  flex-grow: 0;
+  background-color: #e0e0e0;
+  cursor: col-resize;
+  border-left: 1px solid #ccc;
+  border-right: 1px solid #ccc;
+}
+.splitter:hover {
+  background-color: #d0d0d0;
 }
 
 .controls {
@@ -52,7 +138,6 @@ main {
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
-  font-family: sans-serif;
   font-size: 1.2rem;
 }
 
