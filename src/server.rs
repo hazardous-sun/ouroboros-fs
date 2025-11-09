@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use std::{env, error, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -15,12 +15,34 @@ use crate::{
     protocol,
 };
 
-type AnyErr = Box<dyn error::Error + Send + Sync>;
+type AnyErr = Box<dyn Error + Send + Sync>;
 
 /// Run the TCP server and handle connections.
 pub async fn run(bind_addr: &str, gossip_interval: Duration) -> Result<(), AnyErr> {
-    // Initialize TCP listener and collect its address
-    let listener = TcpListener::bind(bind_addr).await?;
+    // 1. Parse the address with an explicit type annotation
+    let addr: std::net::SocketAddr = bind_addr.parse()?;
+
+    // 2. Create a socket based on IP version
+    let socket = if addr.is_ipv6() {
+        TcpSocket::new_v6()?
+    } else {
+        TcpSocket::new_v4()?
+    };
+
+    // 3. Set the SO_REUSEADDR option
+    socket.set_reuseaddr(true)?;
+
+    // 4. Set the SO_REUSEPORT option (required on macOS/BSD to bypass TIME_WAIT)
+    #[cfg(unix)]
+    socket.set_reuseport(true)?;
+
+    // 5. Bind the socket to the address
+    socket.bind(addr)?;
+
+    // 6. Listen for incoming connections
+    let listener = socket.listen(1024)?;
+
+    // 7. Get the local address
     let local = listener.local_addr()?;
 
     // Initialize Node structure
@@ -897,7 +919,11 @@ fn csv_escape(s: &str) -> String {
 }
 
 fn host_of(addr: &str) -> &str {
-    addr.split(':').next().unwrap_or("127.0.0.1")
+    if addr.contains(':') {
+        addr.split(':').next().unwrap_or("127.0.0.1")
+    } else {
+        "127.0.0.1" // Assume localhost if no host is given
+    }
 }
 
 /* --- Gossip and Healing Functions --- */
@@ -970,6 +996,7 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
     );
     let dead_port = port_str(&dead_addr).to_string();
     let dead_host = host_of(&dead_addr);
+    let full_dead_addr = format!("{}:{}", dead_host, dead_port);
 
     // 1. Update local map to Dead
     node.update_node_status(dead_port.clone(), crate::NodeStatus::Dead)
@@ -980,13 +1007,13 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
     node.broadcast_netmap_update().await;
 
     // 3. Start a new process
-    println!("[{}] Respawning node at {}", node.port, dead_addr);
+    println!("[{}] Respawning node at {}", node.port, full_dead_addr);
     let exe = current_exe()?;
 
     let mut cmd = Command::new(exe);
     cmd.arg("run")
         .arg("--addr")
-        .arg(&dead_addr)
+        .arg(&full_dead_addr)
         .arg("--wait-time")
         .arg(node.gossip_interval.as_millis().to_string());
 
@@ -996,25 +1023,27 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
         let _ = cmd.process_group(0);
     }
 
-    // Spawn the child and detach it by just dropping the handle.
-    // The process will keep running.
+    // Spawn the child and detach it
     let _ = cmd.spawn()?;
 
     // Wait for it to be up
     println!(
         "[{}] Waiting for respawned node {} to listen...",
-        node.port, dead_addr
+        node.port, full_dead_addr
     );
     wait_until_listening(dead_host, dead_port.parse()?, Duration::from_secs(10)).await?;
-    println!("[{}] Respawned node {} is up.", node.port, dead_addr);
+    println!("[{}] Respawned node {} is up.", node.port, full_dead_addr);
 
     // 4. Update map to Alive
     node.update_node_status(dead_port.clone(), crate::NodeStatus::Alive)
         .await;
 
     // 5. Share shared data
-    println!("[{}] Sharing network data with {}", node.port, dead_addr);
-    share_data_with_new_node(&node, &dead_addr).await?;
+    println!(
+        "[{}] Sharing network data with {}",
+        node.port, full_dead_addr
+    );
+    share_data_with_new_node(&node, &full_dead_addr).await?;
 
     // 6. Broadcast change (Alive)
     println!("[{}] Broadcasting node {} as Alive", node.port, dead_port);
@@ -1022,7 +1051,7 @@ async fn handle_node_death(node: Arc<Node>, dead_addr: String) -> Result<(), Any
 
     println!(
         "[{}] Healing process for {} complete.",
-        node.port, dead_addr
+        node.port, full_dead_addr
     );
     Ok(())
 }
@@ -1060,8 +1089,11 @@ async fn share_data_with_new_node(node: &Node, new_node_addr: &str) -> Result<()
     }
 
     // Share its NEXT hop
-    let next_hop = node.get_next_for_node(port_str(new_node_addr)).await;
-    if let Some(next_addr) = next_hop {
+    let next_hop_port = node.get_next_for_node(port_str(new_node_addr)).await;
+    if let Some(port) = next_hop_port {
+        // Reconstruct the full address from the healing node's host and the port
+        let host = host_of(&node.port);
+        let next_addr = format!("{}:{}", host, port);
         let mut s_next = tokio::time::timeout(timeout, TcpStream::connect(new_node_addr)).await??;
         s_next
             .write_all(format!("NODE NEXT {}\n", next_addr).as_bytes())
