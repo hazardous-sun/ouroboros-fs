@@ -16,6 +16,9 @@ It allows you to spawn multiple server nodes that automatically wire themselves 
 the network are **sharded** (split) and distributed across all nodes. The network is **self-healing**: it detects node
 failures, automatically respawns them, and reintegrates them into the ring by syncing the network state.
 
+It also includes an optional **gateway service** that acts as a single entry point, automatically proxying client
+requests to any healthy node in the ring.
+
 ---
 
 ## Core Features
@@ -26,6 +29,8 @@ failures, automatically respawns them, and reintegrates them into the ring by sy
   data chunks from its successor node.
 * **Self-Healing Ring:** Nodes constantly check their neighbors. If a node crashes, its neighbor detects the failure,
   respawns the dead node, and syncs the network state (topology, file locations) to the new process.
+* **Optional Gateway Service:** Run a single-entry-point gateway that discovers healthy nodes and automatically proxies
+  client commands (e.g., `FILE PUSH`, `FILE PULL`) to them.
 * **Manual Healing:** A `NODE HEAL` command allows a client to trigger a ring-wide health check, forcing every node to
   check its neighbor and initiate the healing process for any dead nodes it finds.
 * **Automatic Discovery:** Includes protocols for mapping the ring's topology (`TOPOLOGY WALK`) and discovering the
@@ -60,8 +65,7 @@ The system shards files across the network for distributed storage. Each node st
        the
        total number of `parts`.
     3. It then iterates from chunk `1` to `N`, calculating which node in the ring *should* hold that specific chunk (
-       e.g.,
-       `a.txt.part-002-of-003`).
+       e.g., `a.txt.part-002-of-003`).
     4. **Happy Path:** It sends a `FILE GET-CHUNK` command to the target node, which reads the chunk from its `content/`
        directory and returns it.
     5. **Failure Path:** If the target node is dead (request fails), the originating node:
@@ -112,6 +116,22 @@ The network actively monitors and heals itself.
    from a node, it will immediately mark that node as `Dead` and broadcast the update, often detecting failures faster
    than the gossip loop.
 
+### Gateway Service (Mini-DNS)
+
+You can optionally run a gateway service using the `--dns-port` flag when running `set-network`. This service acts as a
+simple, stateless proxy and single entry point for the network.
+
+1. **Polling:** The gateway runs a background loop. At a regular interval (set by `--dns-poll`), it sends a `NETMAP GET`
+   command to one of the ring nodes to fetch the status of the entire network.
+2. **Caching Status:** It uses the `NETMAP GET` response to build and refresh an internal map of all nodes and their
+   `Alive`/`Dead` status.
+3. **Proxying:** When a client connects to the gateway (e.g., to send a `FILE PUSH` command), the gateway checks its
+   internal map, finds the first available node marked as `Alive`, and transparently proxies the entire TCP connection
+   to that healthy node.
+
+This provides a single, stable entry point for the network, so clients don't need to know the address of any specific
+node.
+
 ---
 
 ## Getting Started
@@ -124,38 +144,46 @@ You'll need the Rust toolchain installed.
 cargo build --release
 ```
 
-### 2\. Run a Network
+### 2. Run a Network
 
-The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you.
+The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you. To include the
+new gateway service, use the `--dns-port` flag.
 
 ```bash
-# This will start 5 nodes on ports 7000, 7001, 7002, 7003, and 7004
-# It will then wire them together (7000 -> 7001 -> ... -> 7004 -> 7000)
-cargo run --release -- set-network --nodes 5 --base-port 7000
+# This will start 5 nodes (7000-7004) AND a gateway service on port 8000
+# The gateway will poll the network status every 5 seconds
+cargo run --release -- set-network \
+    --nodes 5 \
+    --base-port 7000 \
+    --dns-port 8000 \
+    --dns-poll 5000
 ```
 
-This command will block, holding the network open. Press `Ctrl-C` to shut down all child node processes.
+This command will block, holding the network open. It will also start a **gateway service** on the port specified by
+`--dns-port`. This gateway acts as a unified entry point for all client requests.
 
-### 3\. Interact with the Network
+Press `Ctrl-C` to shut down all child node processes.
 
-The [`scripts/`](./scripts) directory contains helpers for interacting with the ring (via port 7000 by default) using
-`netcat`.
+### 3. Interact with the Network
+
+The [`scripts/`](./scripts) directory contains helpers for interacting with the ring using `netcat`. If you are running
+the **gateway service** (e.g., on port 8000), you can point all scripts to that single port.
 
 ```bash
-# Push this project's Cargo.toml file to the ring
-./scripts/push_file.sh Cargo.toml
+# Push this project's Cargo.toml file (via the gateway on port 8000)
+./scripts/push_file.sh -p 8000 -f Cargo.toml
 
-# List all distributed files (output is CSV)
-./scripts/list_files.sh
+# List all distributed files (via the gateway)
+./scripts/list_files.sh -p 8000
 
-# Pull the file back (and save it as 'downloaded_file')
-./scripts/pull_file.sh Cargo.toml > downloaded_file
+# Pull the file back (via the gateway and save it as 'downloaded_file')
+./scripts/pull_file.sh -p 8000 -f Cargo.toml > downloaded_file
 
-# Get the status of all nodes in the network
-./scripts/get_nodes.sh
+# Get the status of all nodes (via the gateway)
+./scripts/get_nodes.sh -p 8000
 
-# Manually trigger a network-wide health check and heal
-./scripts/heal_network.sh
+# Manually trigger a network-wide health check (via the gateway)
+./scripts/heal_network.sh -p 8000
 ```
 
 ---
@@ -171,7 +199,7 @@ These are the primary commands you would send to a node.
 
 * **`NODE NEXT <addr>`**: Sets the next hop for a node to form the ring.
 * **`NODE STATUS`**: Asks a node for its port and configured next hop.
-* **`NODE HEAL`**: (Client -\> any node) Initiates a manual, ring-wide heal walk. Each node is forced to check its
+* **`NODE HEAL`**: (Client -> any node) Initiates a manual, ring-wide heal walk. Each node is forced to check its
   neighbor and respawn it if it's dead. Blocks until the entire ring has been checked.
 * **`NETMAP GET`**: Asks a node for its current view of the network map (all nodes and their `Alive`/`Dead` status).
 * **`TOPOLOGY WALK`**: Initiates a ring walk to map the connections (e.g., `7000->7001;7001->7002`).
@@ -193,11 +221,11 @@ These commands are used by the nodes to communicate with each other.
 * **`FILE RELAY-STREAM ...`**: Forwards a file chunk (and the remaining stream) to the next node during a `FILE PUSH`
   operation.
 * **`FILE GET-CHUNK <name>`**: Requests a specific file chunk from another node during a `FILE PULL` operation.
-* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -\> Node i) Notifies the predecessor node that a new chunk is
+* **`FILE NOTIFY-CHUNK-SAVED <name>`**: (Node i+1 -> Node i) Notifies the predecessor node that a new chunk is
   available for backup.
-* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -\> Node i+1) Requests the raw bytes of a specific chunk for backup (
-  response is size-prefixed).
-* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -\> Node i-1) Requests a specific file chunk from the predecessor's
+* **`FILE GET-CHUNK-FOR-BACKUP <name>`**: (Node i -> Node i+1) Requests the raw bytes of a specific chunk for
+  backup (response is size-prefixed).
+* **`FILE GET-BACKUP-CHUNK <name>`**: (Node i -> Node i-1) Requests a specific file chunk from the predecessor's  
   `/backup` directory. Used by `FILE PULL` as a failover when a node is dead.
 * **`... HOP` / `... DONE`**: Various commands like `NETMAP HOP` and `TOPOLOGY DONE` are used to pass discovery messages
   around the ring until they return to their origin.
