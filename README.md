@@ -5,10 +5,8 @@
 
 ---
 
-<div style="text-align: center;">
-    <img src="docs/assets/ouroboros_fs_logo.png" alt="OuroborosFS Logo" width="75%" />
-</div>
-
+| ![OuroborosFS Logo](docs/assets/ouroboros_fs_logo.png) |
+|:--:|
 
 ---
 
