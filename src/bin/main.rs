@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use libc;
 use ouroboros_fs::run;
-use std::{env, error::Error, fs, path::Path, path::PathBuf, time::Duration};
+use std::{env, error::Error, fs, path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -55,6 +55,12 @@ enum Cmd {
         /// Inform if the "nodes" directory should be reused.
         #[arg(short, long)]
         overwrite_nodes_dir: bool,
+        /// Run the DNS Gateway on this port
+        #[arg(long = "dns-port")]
+        dns_port: Option<u16>,
+        /// Time (ms) between gateway status polls
+        #[arg(long = "dns-poll", default_value_t = 10000u64)]
+        dns_poll_ms: u64,
     },
 }
 
@@ -86,6 +92,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             wait_ms,
             wait_time,
             overwrite_nodes_dir,
+            dns_port,
+            dns_poll_ms,
         } => {
             set_network(
                 nodes,
@@ -95,6 +103,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Duration::from_millis(wait_ms),
                 wait_time,
                 overwrite_nodes_dir,
+                dns_port,
+                dns_poll_ms,
             )
             .await
         }
@@ -140,6 +150,8 @@ async fn set_network(
     extra_wait: Duration,
     wait_time: u64,
     overwrite_nodes_dir: bool,
+    dns_port: Option<u16>,
+    dns_poll_ms: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if nodes == 0 {
         tracing::warn!("--nodes must be >= 1");
@@ -225,7 +237,35 @@ async fn set_network(
 
     tracing::info!("Ring wired successfully.");
 
-    // 5. Start a full investigation from the first node
+    // 5. Start the DNS Gateway if requested
+    if let Some(port) = dns_port {
+        // Create the list of all node addresses
+        let node_addrs: Vec<String> = (0..nodes)
+            .map(|i| format!("{}:{}", host, base_port + i))
+            .collect();
+
+        let gateway = ouroboros_fs::Gateway::new(node_addrs);
+
+        // Spawn the polling loop in the background
+        let poll_gateway = Arc::clone(&gateway);
+        let poll_interval = Duration::from_millis(dns_poll_ms);
+        tokio::spawn(async move {
+            // Give nodes a moment to initialize
+            sleep(Duration::from_millis(1000)).await;
+            poll_gateway.run_polling_loop(poll_interval).await;
+        });
+
+        // Spawn the main gateway server
+        let server_gateway = Arc::clone(&gateway);
+        let dns_listen_addr = format!("{}:{}", host, port);
+        tokio::spawn(async move {
+            if let Err(e) = server_gateway.run_server(dns_listen_addr).await {
+                tracing::error!(error = ?e, "Gateway server failed");
+            }
+        });
+    }
+
+    // 6. Start a full investigation from the first node
     let start_addr = format!("{host}:{base_port}");
     if let Err(e) = send_netmap_discover(&start_addr).await {
         tracing::warn!(start_addr = %start_addr, error = ?e, "Failed to start netmap discover");
@@ -233,21 +273,21 @@ async fn set_network(
         tracing::info!(start_addr = %start_addr, "Started netmap discover");
     }
 
-    // 6. Start a topology walk to populate topology maps
+    // 7. Start a topology walk to populate topology maps
     if let Err(e) = send_topology_walk(&start_addr).await {
         tracing::warn!(start_addr = %start_addr, error = ?e, "Failed to start topology walk");
     } else {
         tracing::info!(start_addr = %start_addr, "Started topology walk");
     }
 
-    // 7. Optionally block until user quits / Ctrl-C
+    // 8. Optionally block until user quits / Ctrl-C
     if block {
         tracing::info!("Type 'quit' or press Ctrl-C to stop…");
         wait_for_quit_or_ctrl_c().await;
         tracing::info!("Stopping nodes…");
     }
 
-    // 8. Cleanup
+    // 9. Cleanup
     #[cfg(unix)]
     {
         tracing::info!(pgid = %pgid, "Stopping process group");
