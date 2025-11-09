@@ -1,45 +1,29 @@
 <script setup lang="ts">
-import {ref, onMounted, onUnmounted} from 'vue'
-import fileListData from '../../file_structure.json'
+import { onMounted, onUnmounted } from 'vue'
+import { useNetworkStore } from '@/stores/network'
 
 const props = withDefaults(
     defineProps<{
       refreshInterval?: number
     }>(),
     {
-      refreshInterval: 2000
+      refreshInterval: 5000 // Default 5 seconds
     }
 )
 
-const fileList = ref<string[]>([])
-const isLoading = ref(false)
-const lastUpdated = ref<string>('')
+const store = useNetworkStore()
 let timerId: number | undefined = undefined
 
-async function fetchData() {
-  isLoading.value = true
-  console.log('Refreshing file list from JSON...')
-  fileList.value = fileListData.slice()
-  const timestamp = new Date().toLocaleTimeString()
-  lastUpdated.value = `Last Updated: ${timestamp}`
-  isLoading.value = false
-}
-
 onMounted(() => {
-  // 1. Fetch data on initial component load
-  fetchData()
-
-  // 2. Set up the auto-refresh timer
-  timerId = window.setInterval(() => {
-    fetchData()
-  }, props.refreshInterval)
+  // Fetch immediately
+  store.fetchFiles()
+  // Set up the auto-refresh timer
+  timerId = window.setInterval(store.fetchFiles, props.refreshInterval)
 })
 
 onUnmounted(() => {
-  // 3. Clean up the timer when the component is destroyed
-  if (timerId) {
-    clearInterval(timerId)
-  }
+  // Clean up the timer when the component is destroyed
+  if (timerId) clearInterval(timerId)
 })
 </script>
 
@@ -48,21 +32,36 @@ onUnmounted(() => {
     <div class="header">
       <div>
         <h3>File List</h3>
-        <small>{{ lastUpdated }}</small>
+        <small>{{ store.lastFilesUpdate }}</small>
       </div>
-      <button @click="fetchData" :disabled="isLoading">
-        {{ isLoading ? 'Refreshing...' : 'Refresh' }}
+      <button @click="store.fetchFiles" :disabled="store.filesLoading">
+        {{ store.filesLoading ? 'Refreshing...' : 'Refresh' }}
       </button>
     </div>
 
     <div class="tree-content">
-      <div v-if="isLoading && fileList.length === 0">Loading...</div>
+      <div v-if="store.filesLoading && store.files.length === 0">Loading...</div>
 
-      <ul v-else class="file-list">
-        <li v-for="file in fileList" :key="file" class="file-item">
-          {{ file }}
-        </li>
-      </ul>
+      <div v-else-if="store.files.length === 0" class="empty-state">
+        No files found.
+      </div>
+
+      <table v-else class="file-list-table">
+        <thead>
+        <tr>
+          <th>Name</th>
+          <th>Size (bytes)</th>
+          <th>Start Node</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr v-for="file in store.files" :key="file.name" class="file-item">
+          <td>{{ file.name }}</td>
+          <td>{{ file.size }}</td>
+          <td>{{ file.start }}</td>
+        </tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </template>
@@ -73,7 +72,7 @@ onUnmounted(() => {
   flex-direction: column;
   height: 100%;
   padding: 0 10px;
-  min-width: 250px;
+  min-width: 300px;
 }
 
 .header {
@@ -100,16 +99,29 @@ onUnmounted(() => {
   padding-top: 10px;
 }
 
-.file-list {
-  list-style: none;
-  padding-left: 5px;
-  margin: 0;
+.empty-state {
+  color: #777;
+  font-style: italic;
+  text-align: center;
+  padding-top: 20px;
+}
+
+.file-list-table {
+  width: 100%;
+  border-collapse: collapse;
   font-family: monospace;
 }
 
-.file-item {
-  padding: 4px 8px;
-  border-radius: 4px;
+.file-list-table th,
+.file-list-table td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.file-list-table th {
+  font-weight: bold;
+  background-color: #f9f9f9;
 }
 
 .file-item:hover {
