@@ -8,4 +8,39 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   NC_OPTS="-w 1"
 fi
 
-printf 'FILE LIST\n' | nc ${NC_OPTS} 127.0.0.1 7000
+# --- Defaults ---
+HOST="127.0.0.1"
+PORT="7000"
+
+# --- Usage Function ---
+usage() {
+  echo "Usage: $0 [-h <host>] [-p <port>]" >&2
+  echo "  -h, --host    Network host (default: 127.0.0.1)." >&2
+  echo "  -p, --port    Network port (default: 7000)." >&2
+  exit 1
+}
+
+# --- Parse Options ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --host)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      HOST="$2"
+      shift 2
+      ;;
+    -p | --port)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      PORT="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
+
+printf 'FILE LIST\n' | nc ${NC_OPTS} ${HOST} ${PORT}

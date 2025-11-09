@@ -15,22 +15,66 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   WC_OPTS="-c"
 fi
 
-# Check if the user passed a path
-if [ "$#" -lt 1 ]; then
-  echo "A file path is required to run the script"
+# --- Defaults ---
+HOST="127.0.0.1"
+PORT="7000"
+LOCAL_FILE=""
+
+# --- Usage Function ---
+usage() {
+  echo "Usage: $0 -f <local_file_path> [-h <host>] [-p <port>]" >&2
+  echo "  -f, --file    Path to the local file to push." >&2
+  echo "  -h, --host    Network host (default: 127.0.0.1)." >&2
+  echo "  -p, --port    Network port (default: 7000)." >&2
+  echo "Example: $0 -f ./Cargo.toml" >&2
+  exit 1
+}
+
+# --- Parse Options ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f | --file)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      LOCAL_FILE="$2"
+      shift 2
+      ;;
+    -h | --host)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      HOST="$2"
+      shift 2
+      ;;
+    -p | --port)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      PORT="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
+
+# --- Validate ---
+if [ -z "${LOCAL_FILE}" ]; then
+  echo "Error: -f, --file is a required argument." >&2
+  usage
+fi
+
+if [ ! -e "${LOCAL_FILE}" ]; then
+  echo "Error: File not found: ${LOCAL_FILE}" >&2
   exit 1
 fi
 
-# Check if the path is valid
-if [ ! -e "$1" ]; then
-  echo "Invalid file path provided"
-  exit 1
-fi
-
-FILE="$1";
-
+# --- Action ---
 # Get the byte count from wc and pipe to `xargs` to trim whitespace (for BSD wc)
-SIZE_STR=$(wc ${WC_OPTS} < "${FILE}" | xargs)
+SIZE_STR=$(wc ${WC_OPTS} < "${LOCAL_FILE}" | xargs)
+# Get just the filename from the path
+FILE_NAME=$(basename "${LOCAL_FILE}")
 
+echo "Pushing '${LOCAL_FILE}' as '${FILE_NAME}' (${SIZE_STR} bytes) to ${HOST}:${PORT}..."
 # Build message header and body, then send it to a node using netcat
-( printf "FILE PUSH ${SIZE_STR} ${FILE}\n"; cat "${FILE}" ) | nc ${NC_OPTS} 127.0.0.1 7000
+( printf "FILE PUSH ${SIZE_STR} ${FILE_NAME}\n"; cat "${LOCAL_FILE}" ) | nc ${NC_OPTS} ${HOST} ${PORT}

@@ -8,11 +8,44 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   NC_OPTS="-w 1"
 fi
 
+# --- Defaults ---
 HOST="127.0.0.1"
-PORT="${1:-7000}" # Default to port 7000 if no arg provided
+PORT="7000"
+
+# --- Usage Function ---
+usage() {
+  echo "Usage: $0 [-h <host>] [-p <port>]" >&2
+  echo "Triggers a manual heal of the entire network." >&2
+  echo "  -h, --host    Network host (default: 127.0.0.1)." >&2
+  echo "  -p, --port    Network port (default: 7000)." >&2
+  exit 1
+}
+
+# --- Parse Options ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --host)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      HOST="$2"
+      shift 2
+      ;;
+    -p | --port)
+      if [[ -z "$2" || "$2" == -* ]]; then echo "Error: $1 requires an argument." >&2; usage; fi
+      PORT="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
 
 echo "Sending NODE HEAL to ${HOST}:${PORT}..."
-echo "Waiting for response (this may take a minute)..."
+echo "Waiting for response (this may take up to a minute)..."
 
 # Send the NODE HEAL command
 # This will wait for the server to send a response
