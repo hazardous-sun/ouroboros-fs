@@ -1,4 +1,4 @@
-use crate::{NodeStatus, node::port_str};
+use crate::{NodeStatus};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io;
