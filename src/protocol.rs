@@ -6,6 +6,9 @@
 //!   - "NODE NEXT <addr>" (client -> any node)
 //!   - "NODE STATUS"      (client -> any node)
 //!   - "NODE PING"        (node -> node)
+//!   - "NODE HEAL"        (client -> any node)
+//!   - "NODE HEAL-HOP <token> <start_addr>" (node -> node)
+//!   - "NODE HEAL-DONE <token>"             (last node -> start node)
 //!
 //! RING
 //!   - "RING FORWARD <ttl> <message...>"
@@ -50,6 +53,14 @@ pub enum Command {
     NodeNext(String), // NODE NEXT <addr>
     NodeStatus,       // NODE STATUS
     NodePing,         // NODE PING
+    NodeHeal,         // "NODE HEAL" (client)
+    NodeHealHop {
+        token: String,
+        start_addr: String,
+    }, // "NODE HEAL-HOP <token> <start>" (internal)
+    NodeHealDone {
+        token: String,
+    }, // "NODE HEAL-DONE <token>" (internal)
 
     // RING
     RingForward {
@@ -165,6 +176,31 @@ fn parse_node_cmd(rest: &str) -> Result<Command, String> {
     if rest.eq_ignore_ascii_case("PING") {
         return Ok(Command::NodePing);
     }
+    if rest.eq_ignore_ascii_case("HEAL") {
+        return Ok(Command::NodeHeal);
+    }
+    if let Some(rest) = rest.strip_prefix("HEAL-HOP ") {
+        let mut parts = rest.splitn(2, ' ');
+        let token = parts.next().unwrap_or("").trim();
+        let start_addr = parts.next().unwrap_or("").trim();
+        if token.is_empty() || start_addr.is_empty() {
+            return Err("malformed NODE HEAL-HOP".into());
+        }
+        return Ok(Command::NodeHealHop {
+            token: token.to_string(),
+            start_addr: start_addr.to_string(),
+        });
+    }
+    if let Some(token) = rest.strip_prefix("HEAL-DONE ") {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("malformed NODE HEAL-DONE".into());
+        }
+        return Ok(Command::NodeHealDone {
+            token: token.to_string(),
+        });
+    }
+
     Err("unknown NODE command".into())
 }
 

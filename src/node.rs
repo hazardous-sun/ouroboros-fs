@@ -38,6 +38,9 @@ pub struct Node {
     pending_walks: RwLock<HashMap<String, oneshot::Sender<String>>>,
     walk_counter: AtomicU64,
 
+    // HEAL pending acks (start node only)
+    pending_heals: RwLock<HashMap<String, oneshot::Sender<()>>>,
+
     // FILE pending acks (start node only)
     pending_files: RwLock<HashMap<String, oneshot::Sender<()>>>,
     file_counter: AtomicU64,
@@ -64,6 +67,7 @@ impl Node {
             next_port: RwLock::new(None),
             pending_walks: RwLock::new(HashMap::new()),
             walk_counter: AtomicU64::new(1),
+            pending_heals: RwLock::new(HashMap::new()),
             pending_files: RwLock::new(HashMap::new()),
             file_counter: AtomicU64::new(1),
             network_nodes,
@@ -118,13 +122,7 @@ impl Node {
             .map(|(name, tag)| {
                 // Replace special chars in name to avoid parsing errors
                 let safe_name = name.replace(':', "_").replace(';', "_");
-                format!(
-                    "{}:{}:{}:{}",
-                    safe_name,
-                    tag.start,
-                    tag.size,
-                    tag.parts
-                )
+                format!("{}:{}:{}:{}", safe_name, tag.start, tag.size, tag.parts)
             })
             .collect::<Vec<_>>()
             .join(";")
@@ -175,6 +173,15 @@ impl Node {
         rx
     }
 
+    pub async fn register_heal_walk(&self, token: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_heals
+            .write()
+            .await
+            .insert(token.to_string(), tx);
+        rx
+    }
+
     pub async fn forward_topology_hop(
         &self,
         token: &str,
@@ -192,6 +199,15 @@ impl Node {
     pub async fn finish_walk(&self, token: &str, history: String) -> bool {
         if let Some(tx) = self.pending_walks.write().await.remove(token) {
             let _ = tx.send(history);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn finish_heal_walk(&self, token: &str) -> bool {
+        if let Some(tx) = self.pending_heals.write().await.remove(token) {
+            let _ = tx.send(());
             true
         } else {
             false
