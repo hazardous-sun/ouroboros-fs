@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
-import TreeNode, { type Node } from './TreeNode.vue'
+import {ref, onMounted, onUnmounted} from 'vue'
+import fileListData from '../../file_structure.json'
 
 const props = withDefaults(
     defineProps<{
@@ -11,46 +11,17 @@ const props = withDefaults(
     }
 )
 
-const treeData = ref<Node | null>(null)
+const fileList = ref<string[]>([])
 const isLoading = ref(false)
+const lastUpdated = ref<string>('')
 let timerId: number | undefined = undefined
-
-function getMockData(): Node {
-  const timestamp = new Date().toLocaleTimeString().split(' ')[0]
-  return {
-    id: 'root',
-    name: 'src',
-    type: 'folder',
-    children: [
-      {
-        id: 'c1',
-        name: 'components',
-        type: 'folder',
-        children: [
-          { id: 'f1', name: 'NodesGraph.vue', type: 'file' },
-          { id: 'f2', name: 'DirectoryTree.vue', type: 'file' }
-        ]
-      },
-      {
-        id: 'c2',
-        name: 'stores',
-        type: 'folder',
-        children: [{ id: 'f3', name: 'counter.ts', type: 'file' }]
-      },
-      { id: 'f4', name: `App.vue (refreshed at ${timestamp})`, type: 'file' },
-      { id: 'f5', name: 'main.ts', type: 'file' }
-    ]
-  }
-}
 
 async function fetchData() {
   isLoading.value = true
-  console.log('Refreshing directory tree...')
-
-  // Simulating network latency
-  await new Promise((resolve) => setTimeout(resolve, 300))
-
-  treeData.value = getMockData()
+  console.log('Refreshing file list from JSON...')
+  fileList.value = fileListData.slice()
+  const timestamp = new Date().toLocaleTimeString()
+  lastUpdated.value = `Last Updated: ${timestamp}`
   isLoading.value = false
 }
 
@@ -75,15 +46,23 @@ onUnmounted(() => {
 <template>
   <div class="directory-tree-container">
     <div class="header">
-      <h3>Directory Structure</h3>
+      <div>
+        <h3>File List</h3>
+        <small>{{ lastUpdated }}</small>
+      </div>
       <button @click="fetchData" :disabled="isLoading">
         {{ isLoading ? 'Refreshing...' : 'Refresh' }}
       </button>
     </div>
 
     <div class="tree-content">
-      <div v-if="isLoading && !treeData">Loading...</div>
-      <TreeNode v-if="treeData" :node="treeData" />
+      <div v-if="isLoading && fileList.length === 0">Loading...</div>
+
+      <ul v-else class="file-list">
+        <li v-for="file in fileList" :key="file" class="file-item">
+          {{ file }}
+        </li>
+      </ul>
     </div>
   </div>
 </template>
@@ -110,9 +89,30 @@ onUnmounted(() => {
   margin: 0;
 }
 
+.header small {
+  font-size: 0.8em;
+  color: #555;
+}
+
 .tree-content {
   flex-grow: 1;
   overflow-y: auto;
   padding-top: 10px;
+}
+
+.file-list {
+  list-style: none;
+  padding-left: 5px;
+  margin: 0;
+  font-family: monospace;
+}
+
+.file-item {
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.file-item:hover {
+  background-color: #f0f0f0;
 }
 </style>
