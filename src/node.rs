@@ -18,6 +18,7 @@ use tracing;
 pub struct FileTag {
     pub start: u16,
     pub size: u64,
+    pub parts: u32,
 }
 
 /// Shared node state & actions.
@@ -44,7 +45,7 @@ pub struct Node {
     /// Status of all nodes on the network
     network_nodes: RwLock<HashMap<String, NodeStatus>>,
 
-    /// Mapping of file name -> (start port, size)
+    /// Mapping of file name -> (start port, size, parts)
     pub file_tags: RwLock<HashMap<String, FileTag>>,
 
     /// Time between gossip health checks
@@ -95,17 +96,18 @@ impl Node {
 
     /* ---------------- FILE TAGS ---------------- */
 
-    pub async fn set_file_tag(&self, name: &str, start_port: u16, size: u64) {
+    pub async fn set_file_tag(&self, name: &str, start_port: u16, size: u64, parts: u32) {
         self.file_tags.write().await.insert(
             name.to_string(),
             FileTag {
                 start: start_port,
                 size,
+                parts,
             },
         );
     }
 
-    /// Serializes file tags into a single line: `name1:start1:size1;name2:start2:size2`
+    /// Serializes file tags into a single line: `name1:start1:size1:parts1;name2:start2:size2:parts2`
     pub async fn get_file_tags_entries(&self) -> String {
         let tags = self.file_tags.read().await;
         let mut items: Vec<(&String, &FileTag)> = tags.iter().collect();
@@ -116,24 +118,38 @@ impl Node {
             .map(|(name, tag)| {
                 // Replace special chars in name to avoid parsing errors
                 let safe_name = name.replace(':', "_").replace(';', "_");
-                format!("{}:{}:{}", safe_name, tag.start, tag.size)
+                format!(
+                    "{}:{}:{}:{}",
+                    safe_name,
+                    tag.start,
+                    tag.size,
+                    tag.parts
+                )
             })
             .collect::<Vec<_>>()
             .join(";")
     }
 
-    /// Parses file tags from a single line: `name1:start1:size1;name2:start2:size2`
+    /// Parses file tags from a single line: `name1:start1:size1:parts1;name2:start2:size2:parts2`
     pub async fn set_file_tags_from_entries(&self, entries: &str) {
         let mut tags = self.file_tags.write().await;
         tags.clear();
         for entry in entries.split(';').filter(|s| !s.is_empty()) {
-            let parts: Vec<_> = entry.splitn(3, ':').collect();
-            if parts.len() == 3 {
+            let parts: Vec<_> = entry.splitn(4, ':').collect();
+            if parts.len() == 4 {
                 let name = parts[0];
                 let start_res = parts[1].parse::<u16>();
                 let size_res = parts[2].parse::<u64>();
-                if let (Ok(start), Ok(size)) = (start_res, size_res) {
-                    tags.insert(name.to_string(), FileTag { start, size });
+                let parts_res = parts[3].parse::<u32>();
+                if let (Ok(start), Ok(size), Ok(parts_num)) = (start_res, size_res, parts_res) {
+                    tags.insert(
+                        name.to_string(),
+                        FileTag {
+                            start,
+                            size,
+                            parts: parts_num,
+                        },
+                    );
                 }
             }
         }

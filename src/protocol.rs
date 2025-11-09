@@ -38,6 +38,7 @@
 //! FILE (backup)
 //!   - "FILE NOTIFY-CHUNK-SAVED <name>"   (node -> predecessor node)
 //!   - "FILE GET-CHUNK-FOR-BACKUP <name>" (predecessor node -> node)
+//!   - "FILE GET-BACKUP-CHUNK <name>"     (node -> node, for PULL failover)
 //!
 //! IMPORTANT: the protocol is line-delimited. Any binary payload *follows*
 //! the header line and is exactly <size> bytes long.
@@ -126,6 +127,9 @@ pub enum Command {
     FileGetChunkForBackup {
         name: String,
     }, // "FILE GET-CHUNK-FOR-BACKUP <name>"
+    FileGetBackupChunk {
+        name: String,
+    }, // "FILE GET-BACKUP-CHUNK <name>"
 }
 
 /// Parse one incoming line from the wire into a Command.
@@ -317,6 +321,15 @@ fn parse_file_cmd(rest: &str) -> Result<Command, String> {
             return Err("missing file name for FILE GET-CHUNK-FOR-BACKUP".into());
         }
         return Ok(Command::FileGetChunkForBackup { name });
+    }
+
+    // GET-BACKUP-CHUNK
+    if let Some(rest) = rest.strip_prefix("GET-BACKUP-CHUNK ") {
+        let name = rest.to_string();
+        if name.trim().is_empty() {
+            return Err("missing file name for FILE GET-BACKUP-CHUNK".into());
+        }
+        return Ok(Command::FileGetBackupChunk { name });
     }
 
     // RELAY-BLOB
