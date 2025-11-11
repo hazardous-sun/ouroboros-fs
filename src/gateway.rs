@@ -93,6 +93,18 @@ impl Gateway {
         let method = parts.get(0).cloned().unwrap_or("GET");
         let path = parts.get(1).cloned().unwrap_or("/");
 
+        // Handle GET /file/pull/<filename>
+        if method == "GET" && path.starts_with("/file/pull/") {
+            return if let Some(filename) = path.strip_prefix("/file/pull/") {
+                match self.handle_file_pull(writer, filename).await {
+                    Ok(_) => Ok(()), // Full response was sent
+                    Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+                }
+            } else {
+                Self::send_error_response(writer, 400, "Bad Request: Missing filename").await
+            };
+        }
+
         match (method, path) {
             ("OPTIONS", _) => {
                 // Handle CORS preflight requests
@@ -195,10 +207,36 @@ impl Gateway {
         }
 
         if !found_ok {
-            return Err("Node failed to store file: did not receive OK".to_string().into());
+            return Err("Node failed to store file: did not receive OK"
+                .to_string()
+                .into());
         }
 
         tracing::info!(file = %filename, "File successfully pushed to ring");
+        Ok(())
+    }
+
+    /// Connects to the ring and streams a file back to an HTTP client.
+    async fn handle_file_pull(
+        self: Arc<Self>,
+        writer: &mut (impl AsyncWrite + Unpin),
+        filename: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 1. Connect to a node in the ring
+        let mut node_stream = self.connect_to_ring().await?;
+        let (mut node_read, mut node_write) = node_stream.split();
+
+        // 2. Send TCP FILE PULL to the node
+        let header = format!("FILE PULL {}\n", filename);
+        node_write.write_all(header.as_bytes()).await?;
+        node_write.shutdown().await?;
+
+        // 3. Send the HTTP 200 OK and file headers to the browser
+        Self::send_file_response_headers(writer, filename).await?;
+
+        // 4. Stream the raw file data from the node directly to the browser
+        copy(&mut node_read, writer).await?;
+
         Ok(())
     }
 
@@ -329,6 +367,23 @@ impl Gateway {
                         Access-Control-Allow-Headers: Content-Type, X-Filename\r\n\
                         Connection: close\r\n\
                         \r\n";
+        writer.write_all(response.as_bytes()).await
+    }
+
+    /// Sends HTTP headers for a file pull.
+    async fn send_file_response_headers(
+        writer: &mut (impl AsyncWrite + Unpin),
+        filename: &str,
+    ) -> io::Result<()> {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Content-Disposition: attachment; filename=\"{}\"\r\n\
+             Connection: close\r\n\
+             \r\n",
+            filename
+        );
         writer.write_all(response.as_bytes()).await
     }
 
