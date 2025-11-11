@@ -127,6 +127,12 @@ impl Gateway {
                 }
                 Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
             },
+            ("POST", "/network/heal") => match self.trigger_node_heal().await {
+                Ok(msg) => {
+                    Self::send_json_response(writer, serde_json::json!({ "message": msg })).await
+                }
+                Err(e) => Self::send_error_response(writer, 500, &e.to_string()).await,
+            },
             _ => Self::send_error_response(writer, 404, "Not Found").await,
         }
     }
@@ -382,6 +388,29 @@ impl Gateway {
             line.clear();
         }
         Ok(files)
+    }
+
+    /// Connects to the ring, sends "NODE HEAL", and waits for the full response.
+    async fn trigger_node_heal(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 1. Connect to a node in the ring
+        let mut stream = self.connect_to_ring().await?;
+        tracing::info!("Gateway: Sending NODE HEAL to ring");
+
+        // 2. Send the TCP NODE HEAL command
+        stream.write_all(b"NODE HEAL\n").await?;
+
+        // 3. Read the response
+        // `handle_node_heal` in server.rs can take up to 60s
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        let gateway_timeout = Duration::from_secs(65);
+
+        match tokio::time::timeout(gateway_timeout, reader.read_line(&mut response_line)).await {
+            Ok(Ok(0)) => Err("Node disconnected without response".into()),
+            Ok(Ok(_)) => Ok(response_line.trim().to_string()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Err("Gateway timed out waiting for NODE HEAL response".into()),
+        }
     }
 
     // --- TCP HELPERS ---
