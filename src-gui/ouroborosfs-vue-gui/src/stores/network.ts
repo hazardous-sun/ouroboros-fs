@@ -1,5 +1,5 @@
-import { ref } from 'vue'
-import { defineStore } from 'pinia'
+import {ref} from 'vue'
+import {defineStore} from 'pinia'
 
 // Matches the `FileInfo` struct in gateway.rs
 export interface FileItem {
@@ -84,6 +84,25 @@ export const useNetworkStore = defineStore('network', () => {
         }
     }
 
+    /** Triggers a browser download for a file */
+    function filePull(filename: string) {
+        // Ensure the filename is properly encoded for a URL path segment.
+        const encodedFilename = encodeURIComponent(filename);
+        const downloadUrl = `${API_BASE}/file/pull/${encodedFilename}`;
+
+        // Create a temporary link element to trigger the download.
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+
+        link.setAttribute('download', filename);
+
+        document.body.appendChild(link);
+        link.click();
+
+        // Clean up the temporary link
+        document.body.removeChild(link);
+    }
+
     return {
         // State
         nodes,
@@ -98,5 +117,6 @@ export const useNetworkStore = defineStore('network', () => {
         netmapGet,
         fileList,
         filePush,
+        filePull,
     }
 })

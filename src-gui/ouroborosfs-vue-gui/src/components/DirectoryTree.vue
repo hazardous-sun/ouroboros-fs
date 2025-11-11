@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
-import { useNetworkStore } from '@/stores/network'
+import {onMounted, onUnmounted} from 'vue'
+import {useNetworkStore} from '@/stores/network'
 
 const props = withDefaults(
     defineProps<{
@@ -52,6 +52,7 @@ onUnmounted(() => {
           <th>Name</th>
           <th>Size (bytes)</th>
           <th>Start Node</th>
+          <th>Actions</th>
         </tr>
         </thead>
         <tbody>
@@ -59,6 +60,11 @@ onUnmounted(() => {
           <td>{{ file.name }}</td>
           <td>{{ file.size }}</td>
           <td>{{ file.start }}</td>
+          <td class="actions-cell">
+            <button @click="store.filePull(file.name)" class="pull-btn">
+              Pull
+            </button>
+          </td>
         </tr>
         </tbody>
       </table>
@@ -117,6 +123,7 @@ onUnmounted(() => {
   padding: 6px 8px;
   text-align: left;
   border-bottom: 1px solid #f0f0f0;
+  vertical-align: middle;
 }
 
 .file-list-table th {
@@ -126,5 +133,26 @@ onUnmounted(() => {
 
 .file-item:hover {
   background-color: #f0f0f0;
+}
+
+.actions-cell {
+  text-align: center;
+  width: 1%;
+}
+
+.pull-btn {
+  padding: 4px 10px;
+  font-size: 0.9em;
+  font-family: sans-serif;
+  color: #333;
+  background-color: #f0f0f0;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.pull-btn:hover {
+  background-color: #e0e0e0;
 }
 </style>
