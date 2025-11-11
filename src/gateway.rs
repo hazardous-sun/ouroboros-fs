@@ -1,13 +1,16 @@
 use crate::NodeStatus;
+use crate::node::port_str;
 use serde::Serialize;
 use serde_json;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub struct Gateway {
@@ -29,7 +32,7 @@ impl Gateway {
     }
 
     /// Runs the main TCP server to listen for clients
-    pub async fn run_server(self: Arc<Self>, listen_addr: String) -> std::io::Result<()> {
+    pub async fn run_server(self: Arc<Self>, listen_addr: String) -> io::Result<()> {
         let listener = TcpListener::bind(&listen_addr).await?;
         tracing::info!(addr = %listen_addr, "Gateway listening (HTTP + TCP)");
 
@@ -282,31 +285,67 @@ impl Gateway {
 
     // --- API DATA FETCHERS ---
 
-    /// Connects to the ring and sends `NETMAP GET`.
+    /// Sends a "NODE PING" to a single address and returns its status.
+    ///
+    /// This is a lightweight, best-effort check with a short timeout.
+    async fn ping_node(addr: String) -> (String, NodeStatus) {
+        let port = port_str(&addr).to_string();
+        let timeout = Duration::from_millis(500);
+
+        type AnyErr = Box<dyn std::error::Error + Send + Sync>;
+
+        let check = async {
+            // Connect with timeout
+            let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr)).await??;
+
+            // Send the PING command
+            stream.write_all(b"NODE PING\n").await?;
+
+            // Read response with timeout
+            let mut reader = BufReader::new(stream);
+            let mut buf = String::new();
+            tokio::time::timeout(timeout, reader.read_line(&mut buf)).await??;
+
+            if buf.trim().eq_ignore_ascii_case("PONG") {
+                Ok::<NodeStatus, AnyErr>(NodeStatus::Alive)
+            } else {
+                // Got a response, but it wasn't a valid PONG
+                Ok::<NodeStatus, AnyErr>(NodeStatus::Dead)
+            }
+        };
+
+        // Any error (timeout, connection refused, read fail...) means the node is Dead
+        match check.await {
+            Ok(status) => (port, status),
+            Err(_) => (port, NodeStatus::Dead),
+        }
+    }
+
+    /// Checks the real-time status of all nodes by pinging them concurrently.
     async fn fetch_node_map(
         &self,
     ) -> Result<HashMap<String, NodeStatus>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut stream = self.connect_to_ring().await?;
-        stream.write_all(b"NETMAP GET\n").await?;
+        let mut tasks: Vec<JoinHandle<(String, NodeStatus)>> = Vec::new();
 
-        let mut reader = BufReader::new(&mut stream);
-        let mut line = String::new();
+        // 1. Spawn a concurrent ping task for every node address we know
+        for addr in self.node_addrs.clone() {
+            tasks.push(tokio::spawn(Self::ping_node(addr)));
+        }
+
         let mut map = HashMap::new();
 
-        while reader.read_line(&mut line).await? > 0 {
-            if line.starts_with("OK") {
-                break;
+        // 2. Collect the results from all completed tasks
+        for task in tasks {
+            match task.await {
+                Ok((port, status)) => {
+                    map.insert(port, status);
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "A gateway ping task failed (panicked)");
+                }
             }
-            if let Some((port, status_str)) = line.trim().split_once('=') {
-                let status = if status_str.eq_ignore_ascii_case("Dead") {
-                    NodeStatus::Dead
-                } else {
-                    NodeStatus::Alive
-                };
-                map.insert(port.to_string(), status);
-            }
-            line.clear();
         }
+
         Ok(map)
     }
 
