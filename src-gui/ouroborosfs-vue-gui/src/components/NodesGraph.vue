@@ -123,9 +123,19 @@ const lines = computed(() => {
         </small>
         <small v-if="store.nodesLoading">Loading...</small>
       </div>
-      <button @click="store.netmapGet" :disabled="store.nodesLoading">
-        {{ store.nodesLoading ? 'Refreshing...' : 'Refresh' }}
-      </button>
+      <div>
+        <button @click="store.netmapGet" :disabled="store.nodesLoading">
+          {{ store.nodesLoading ? 'Refreshing...' : 'Refresh' }}
+        </button>
+
+        <button
+            @click="store.networkHeal"
+            :disabled="store.healLoading"
+            class="heal-button"
+        >
+          {{ store.healLoading ? 'Healing...' : 'Heal Network' }}
+        </button>
+      </div>
     </div>
 
     <div class="nodes-controls">
@@ -219,6 +229,7 @@ const lines = computed(() => {
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.9em;
+  margin-left: 8px;
 }
 
 .nodes-header button:hover {
@@ -229,6 +240,22 @@ const lines = computed(() => {
   background-color: #aaa;
   color: #eee;
   cursor: not-allowed;
+  border-color: #aaa;
+}
+
+.heal-button {
+  background-color: #e63946;
+  border-color: #e63946;
+}
+
+.heal-button:hover {
+  background-color: #c9303d !important;
+  border-color: #c9303d !important;
+}
+
+.heal-button:disabled {
+  background-color: #aaa !important;
+  border-color: #aaa !important;
 }
 
 .nodes-controls {
