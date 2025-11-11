@@ -21,6 +21,7 @@ export const useNetworkStore = defineStore('network', () => {
     const lastNodesUpdate = ref<string>('')
     const uploadLoading = ref(false)
     const healLoading = ref(false)
+    const killingNodeId = ref<string | null>(null)
     const API_BASE = 'http://127.0.0.1:8000' // TODO: dynamically update this with envs
 
     /** Fetches the latest node status from the gateway */
@@ -122,7 +123,7 @@ export const useNetworkStore = defineStore('network', () => {
             // Simple feedback to the user
             alert(`Heal response: ${responseData.message}`);
 
-            // Refresh the node map
+            // Refresh the node graph
             await netmapGet();
 
         } catch (error) {
@@ -130,6 +131,34 @@ export const useNetworkStore = defineStore('network', () => {
             alert(`Error triggering heal: ${error}`);
         } finally {
             healLoading.value = false
+        }
+    }
+
+    /** Triggers a kill signal for a specific node */
+    async function killNode(nodeId: string) {
+        if (killingNodeId.value) return // Prevent concurrent kills
+        killingNodeId.value = nodeId
+        try {
+            const response = await fetch(`${API_BASE}/node/${nodeId}/kill`, {
+                method: 'POST',
+            });
+
+            const responseData = await response.json();
+
+            if (!response.ok) {
+                throw new Error(responseData.message || 'Kill request failed');
+            }
+
+            alert(`Kill response: ${responseData.message}`);
+
+            // Refresh the node graph
+            await netmapGet();
+
+        } catch (error) {
+            console.error('Failed to trigger kill:', error);
+            alert(`Error triggering kill: ${error}`);
+        } finally {
+            killingNodeId.value = null
         }
     }
 
@@ -143,6 +172,7 @@ export const useNetworkStore = defineStore('network', () => {
         lastNodesUpdate,
         uploadLoading,
         healLoading,
+        killingNodeId,
 
         // Actions
         netmapGet,
@@ -150,5 +180,6 @@ export const useNetworkStore = defineStore('network', () => {
         filePush,
         filePull,
         networkHeal,
+        killNode,
     }
 })
