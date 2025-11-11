@@ -181,7 +181,10 @@ npm run dev
 ```
 
 This will typically make the dashboard available at `http://localhost:5173`. It is pre-configured to communicate with
-the gateway API running on `http://127.0.0.1:8000`.
+the gateway API running on `http://127.0.0.1:8000`. Here's a preview of how it looks like:
+
+| ![OuroborosFS Dashboard](docs/assets/ouroboros_fs_dashboard.png) |
+| :--------------------------------------------------------------: |
 
 ### 4. Interact with the Network
 
