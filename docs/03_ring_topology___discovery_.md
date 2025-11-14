@@ -45,11 +45,11 @@ sequenceDiagram
     Note over Node7001: I'll start the walk. History: "7001->7002"
     Node7001->>Node7002: TOPOLOGY HOP (history: "7001->7002")
 
-    Note over Node7002: I'll add my link. History: "7001->7002;7002->7003"
-    Node7002->>Node7003: TOPOLOGY HOP (history: "...;7002->7003")
+    Note over Node7002: I'll add my link. History: "7001->7002, 7002->7003"
+    Node7002->>Node7003: TOPOLOGY HOP (history: "..., 7002->7003")
 
     Note over Node7003: I'll add my link. My next hop is the start node!
-    Node7003->>Node7001: TOPOLOGY DONE (final history: "...;7003->7001")
+    Node7003->>Node7001: TOPOLOGY DONE (final history: "..., 7003->7001")
 
     Note over Node7001: The walk is complete! I have the full map.
     Node7001-->>Client: Full Topology List
