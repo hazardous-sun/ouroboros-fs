@@ -22,7 +22,24 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
 
 ---
 
-## Core Features
+## Index
+
+1. [Core features](#1-core-features)
+2. [How It Works](#2-how-it-works)
+    1. [File Storage](#21-file-storage)
+    2. [Data Replication](#22-data-replication)
+    3. [Fault Tolerance](#23-fault-tolerance)
+    4. [Gateway Service (TCP Proxy & HTTP API)](#24-gateway-service-tcp-proxy--http-api)
+3. [Getting Started](#3-getting-started)
+   1. [Tutorial](#31-tutorial)
+   2. [Build the Backend](#32-build-the-backend)
+   3. [Run a Network](#33-run-a-network)
+   4. [Run the Web Dashboard (Optional)](#34-run-the-web-dashboard-optional)
+4. [Protocol Overview](#4-protocol-overview)
+   1. [Client Commands](#41-client-commands)
+   2. [Internal (Node-to-Node) Commands](#42-internal-node-to-node-commands)
+
+## 1. Core Features
 
 - **Distributed File Storage:** Files are automatically sharded (split) and stored in chunks across all nodes in the
   ring.
@@ -43,9 +60,9 @@ requests (both raw TCP and HTTP) to any healthy node in the ring.
 
 ---
 
-## How It Works
+## 2. How It Works
 
-### File Storage
+### 2.1. File Storage
 
 The system shards files across the network for distributed storage. Each node stores its chunks in a
 `nodes/<port>/content/` directory.
@@ -75,7 +92,7 @@ The system shards files across the network for distributed storage. Each node st
        and returns it.
     6. The originating node reassembles all chunks in order and streams the complete file back to the client.
 
-### Data Replication
+### 2.2. Data Replication
 
 In addition to sharding, the network automatically replicates data for extra resilience. It uses a single-neighbor
 backup model: **each node is responsible for backing up the data of its successor (neighbor).**
@@ -96,7 +113,7 @@ This is achieved using an active notification workflow:
    chunk data using `FILE GET-CHUNK-FOR-BACKUP`.
 4. **Store Backup:** Node `7000` receives the data and saves it to its local `nodes/7000/backup/` directory.
 
-### Fault Tolerance
+### 2.3. Fault Tolerance
 
 The network actively monitors and heals itself.
 
@@ -114,7 +131,7 @@ The network actively monitors and heals itself.
    from a node, it will immediately mark that node as `Dead` and broadcast the update, often detecting failures faster
    than the gossip loop.
 
-### Gateway Service (TCP Proxy & HTTP API)
+### 2.4. Gateway Service (TCP Proxy & HTTP API)
 
 You can optionally run a gateway service using the `--dns-port` flag when running `set-network`. This service acts as a
 simple, stateless proxy and single entry point for the network.
@@ -138,9 +155,15 @@ node.
 
 ---
 
-## Getting Started
+## 3. Getting Started
 
-### 1. Build the Backend
+### 3.1. Tutorial
+
+There's a learning material that was generated with the help of
+the [AI Codebase Knowledge Builder](https://github.com/The-Pocket/PocketFlow-Tutorial-Codebase-Knowledge) project. You
+can access it [here](./docs/index.md).
+
+### 3.2. Build the Backend
 
 You'll need the Rust toolchain installed.
 
@@ -148,7 +171,7 @@ You'll need the Rust toolchain installed.
 cargo build --release
 ```
 
-### 2. Run a Network
+### 3.3. Run a Network
 
 The easiest way to start is using the `set-network` subcommand, which spawns and wires up a ring for you. The
 `--dns-port` flag starts the gateway, which provides both the TCP proxy and the HTTP API.
@@ -165,7 +188,7 @@ cargo run --release -- set-network \
 
 This command will block, holding the network open.
 
-### 3. Run the Web Dashboard (Optional)
+### 3.4. Run the Web Dashboard (Optional)
 
 The web dashboard is a separate Vue.js application. You'll need Node.js and `npm` installed.
 
@@ -184,7 +207,7 @@ This will typically make the dashboard available at `http://localhost:5173`. It 
 the gateway API running on `http://127.0.0.1:8000`. Here's a preview of how it looks like:
 
 | ![OuroborosFS Dashboard](docs/assets/ouroboros_fs_dashboard.png) |
-| :--------------------------------------------------------------: |
+|:----------------------------------------------------------------:|
 
 ### 4. Interact with the Network
 
@@ -221,7 +244,7 @@ You can use the dashboard to:
 
 ---
 
-## Protocol Overview
+## 4. Protocol Overview
 
 The server's *internal* node-to-node and client-to-node communication uses a simple, line-based ASCII text protocol.
 Commands follow a `<NOUN> <VERB> [params...]` structure.
@@ -229,7 +252,7 @@ Commands follow a `<NOUN> <VERB> [params...]` structure.
 > [!NOTE]
 > This is separate from the HTTP API provided by the gateway for the web dashboard.
 
-### Client Commands
+### 4.1. Client Commands
 
 These are the primary commands you would send to a node (or the gateway) via `netcat`.
 
@@ -245,7 +268,7 @@ These are the primary commands you would send to a node (or the gateway) via `ne
   trailers.
 - **`FILE LIST`**: Asks a node for a CSV-formatted list of all known files and their metadata.
 
-### Internal (Node-to-Node) Commands
+### 4.2. Internal (Node-to-Node) Commands
 
 These commands are used by the nodes to communicate with each other.
 
